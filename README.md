@@ -27,4 +27,6 @@ when extending this package.
 
 Run training with `python examples/train_real_world.py serl --role ...`
 (see that file's module docstring for the two-process actor/learner launch
-shape).
+shape). See [`docs/teleop.md`](docs/teleop.md) for the teleop demo/recording
+workflow, and [`docs/hil-serl-roadmap.md`](docs/hil-serl-roadmap.md) for what
+HIL-SERL capability was and wasn't migrated, and why.
