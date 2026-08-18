@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlgarden-real-world"
+version = "0.0.1"
+description = "Real-world RL orchestration for rl-garden: ActorLoop/LearnerLoop, the franka_real env backend, and SERL/HIL-SERL training loops. Imports rl_garden as a library; overrides/extends it here rather than living inside its repo."
+requires-python = ">=3.10"
+dependencies = [
+    "rl_garden @ git+https://github.com/JaimeParker/rl-garden.git",
+    "torch>=2.1",
+    "numpy",
+    "gymnasium>=0.29",
+    "tyro",
+    "requests",
+]
+
+[project.optional-dependencies]
+# Franka bridge client + teleop intervention wrapper need the sibling
+# rlgarden-robot-infra repo installed (controller/real, teleop/*). ROS
+# itself, required only on the machine running
+# robot_infra/controller/real/franka_bridge.py, is not pip-installable --
+# see that module's docstring in rlgarden-robot-infra.
+robot-infra = ["rlgarden-robot-infra @ git+https://github.com/JaimeParker/rlgarden-robot-infra.git"]
+# collect_data.py's global success/failure keyboard listener.
+reward-collection = ["pynput"]
+# examples/record_teleop_wsrl.py, run_teleop_demo.py: ManiSkill sim envs.
+examples = ["mani_skill"]
+dev = ["pytest", "scipy"]
+
+[project.entry-points."rlgarden.env_backends"]
+franka_real = "rl_garden_real_world.envs.backends.franka_real"
+
+[tool.setuptools.packages.find]
+include = ["rl_garden_real_world*"]
