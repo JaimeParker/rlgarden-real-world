@@ -117,6 +117,88 @@ def test_build_env_composes_reward_classifier_wrapper_when_checkpoint_given(monk
     assert captured["image_keys"] == ("wrist",)
 
 
+def test_build_env_skips_frame_stack_wrapper_by_default(monkeypatch):
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs",
+        lambda backend, req: (_FakeEnv(), None),
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+    args = _base_args()
+    assert args.frame_stack == 1
+    env = _build_env(args, env_request=None)
+
+    from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
+
+    def _unwrap_chain(e):
+        seen = [e]
+        while hasattr(e, "env"):
+            e = e.env
+            seen.append(e)
+        return seen
+
+    assert not any(isinstance(e, ImageFrameStackWrapper) for e in _unwrap_chain(env))
+
+
+def test_build_env_composes_image_frame_stack_wrapper_when_frame_stack_set(monkeypatch):
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs",
+        lambda backend, req: (_WristFakeEnv(), None),
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+    args = _base_args(frame_stack=3, classifier_checkpoint=None)
+    env = _build_env(args, env_request=None)
+
+    from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
+    from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
+
+    assert isinstance(env, TeleopInterventionWrapper)
+    assert isinstance(env.env, ImageFrameStackWrapper)
+    assert env.env.image_keys == ("wrist",)
+    assert env.env.single_observation_space["wrist"].shape == (3, 3, 8, 8)
+
+
+def test_build_env_skips_grasp_penalty_wrapper_by_default(monkeypatch):
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs",
+        lambda backend, req: (_FakeEnv(), None),
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+    args = _base_args()
+    assert args.use_grasp_penalty is False
+    env = _build_env(args, env_request=None)
+
+    from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
+    from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
+
+    assert isinstance(env, TeleopInterventionWrapper)
+    assert not isinstance(env.env, GraspPenaltyWrapper)
+
+
+def test_build_env_composes_grasp_penalty_wrapper_outside_teleop_when_enabled(monkeypatch):
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs",
+        lambda backend, req: (_FakeEnv(), None),
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+    args = _base_args(use_grasp_penalty=True, grasp_penalty_value=-0.1)
+    env = _build_env(args, env_request=None)
+
+    from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
+    from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
+
+    assert isinstance(env, GraspPenaltyWrapper)
+    assert isinstance(env.env, TeleopInterventionWrapper)
+    assert env.penalty == -0.1
+
+
 def test_build_env_wraps_fwbw_outermost_when_fwbw_enabled(monkeypatch):
     monkeypatch.setattr(
         "rl_garden.envs.backend_registry.make_training_envs",

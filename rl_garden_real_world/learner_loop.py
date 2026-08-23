@@ -67,6 +67,7 @@ class LearnerLoop:
 
         self._lock = threading.Lock()
         self._received = 0
+        self._received_by_actor: dict[str, int] = {}
         self._last_checkpoint_update = 0
         self._server = LearnerSyncServer(host, port, on_transition=self._on_transition)
 
@@ -75,7 +76,20 @@ class LearnerLoop:
         with self._lock:
             return self._received
 
+    @property
+    def received_by_actor(self) -> dict[str, int]:
+        """Per-``actor_id`` received-transition counts, for observability
+        when multiple actors push to this learner. Transitions pushed
+        without an ``actor_id`` (``ActorSyncClient(actor_id=None)``, the
+        default) are tallied under ``"unknown"``."""
+        with self._lock:
+            return dict(self._received_by_actor)
+
     def _on_transition(self, transition: dict[str, Any]) -> None:
+        # actor_id is observability-only metadata, not a buffer field --
+        # DictReplayBuffer.add()/TensorReplayBuffer.add() have fixed
+        # signatures with no **kwargs, so it must never reach .add().
+        actor_id = transition.get("actor_id")
         device = self.agent.buffer_device
         tensors = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -85,7 +99,7 @@ class LearnerLoop:
         extra = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in transition.items()
-            if k not in _TRANSITION_TENSOR_KEYS
+            if k not in _TRANSITION_TENSOR_KEYS and k != "actor_id"
         }
         with self._lock:
             self.agent.replay_buffer.add(
@@ -97,6 +111,8 @@ class LearnerLoop:
                 **extra,
             )
             self._received += 1
+            key = actor_id if actor_id is not None else "unknown"
+            self._received_by_actor[key] = self._received_by_actor.get(key, 0) + 1
 
     def _refresh_offline_data(self) -> None:
         """Hook for methods that need to periodically re-read a growing

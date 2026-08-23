@@ -41,6 +41,7 @@ import torch
 
 from rl_garden.algorithms.off_policy import OffPolicyAlgorithm
 from rl_garden_real_world.learner_loop import _TRANSITION_TENSOR_KEYS, LearnerLoop
+from rl_garden_real_world.training._demo_loading import load_demo_pkls
 
 
 class HilSerlLearnerLoop(LearnerLoop):
@@ -70,13 +71,7 @@ class HilSerlLearnerLoop(LearnerLoop):
         # gates LearnerLoop.run()'s learning_starts wait, and HIL-SERL's own
         # analogous gate (`len(replay_buffer) < training_starts`) only ever
         # counts the online buffer, never `--demo_path` preload.
-        device = self.agent.buffer_device
-        for pattern in paths:
-            for pkl_path in sorted(glob.glob(pattern)):
-                with open(pkl_path, "rb") as f:
-                    transitions = pickle.load(f)
-                for transition in transitions:
-                    self._add_transition(self.agent.add_demo_transition, transition, device)
+        load_demo_pkls(paths, self.agent.add_demo_transition, self.agent.buffer_device)
 
     def _reload_snapshots(self) -> None:
         device = self.agent.buffer_device
@@ -114,6 +109,10 @@ class HilSerlLearnerLoop(LearnerLoop):
 
     def _on_transition(self, transition: dict[str, Any]) -> None:
         intervened = bool(transition.pop("intervened", False))
+        # actor_id is observability-only (see LearnerLoop._on_transition) --
+        # popped before .add() and before the online/demo pkl append, so it
+        # never reaches the buffer and is never persisted into snapshots.
+        actor_id = transition.pop("actor_id", None)
         device = self.agent.buffer_device
         with self._lock:
             self._add_transition(self.agent.replay_buffer.add, transition, device)
@@ -122,6 +121,8 @@ class HilSerlLearnerLoop(LearnerLoop):
                 self._add_transition(self.agent.add_demo_transition, transition, device)
                 self._pending_demo.append(transition)
             self._received += 1
+            key = actor_id if actor_id is not None else "unknown"
+            self._received_by_actor[key] = self._received_by_actor.get(key, 0) + 1
             self._step_since_snapshot += 1
             if self._step_since_snapshot >= self._buffer_period:
                 self._snapshot()

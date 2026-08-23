@@ -8,7 +8,7 @@ from scipy.spatial.transform import Rotation
 
 from rl_garden_real_world.envs.franka_real.config import FrankaRealEnvConfig
 from rl_garden_real_world.envs.franka_real.env import FrankaRealEnv
-from rl_garden.envs.wrappers.rotvec_obs import RotvecObsWrapper
+from rl_garden_real_world.envs.wrappers.rotvec_obs import RotvecObsWrapper
 
 from test_franka_real_env import _FakeBridgeClient
 

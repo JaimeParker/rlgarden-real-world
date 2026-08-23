@@ -20,17 +20,32 @@ def _hil_serl_env_request(args, run_name):
 
 def _build_env(args, env_request):
     """Composes the env wrappers built in the SERL v1 round but never wired
-    up until now: rotvec observation conversion (innermost, optional) ->
-    reward classifier -> human intervention -> optional reset-free
-    forward/backward (outer, per ``FWBWActorLoop``/``FWBWResetFreeWrapper``'s
-    documented requirement that it sit outermost)."""
+    up until now: temporal observation stacking (innermost, optional) ->
+    rotvec observation conversion (optional) -> reward classifier -> human
+    intervention -> optional reset-free forward/backward (outer, per
+    ``FWBWActorLoop``/``FWBWResetFreeWrapper``'s documented requirement that
+    it sit outermost)."""
     from rl_garden.envs.backend_registry import make_training_envs
+    from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
     from rl_garden.envs.wrappers.fwbw_reset_free import FWBWResetFreeWrapper
     from rl_garden.envs.wrappers.reward_classifier import RewardClassifierWrapper
-    from rl_garden.envs.wrappers.rotvec_obs import RotvecObsWrapper
+    from rl_garden_real_world.envs.wrappers.rotvec_obs import RotvecObsWrapper
+    from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
     from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
 
     env, _ = make_training_envs(args.env_backend, env_request)
+
+    if args.frame_stack > 1:
+        # FrankaRealEnv has no _init_raw_obs/update_obs_space (ManiSkill-only
+        # APIs) and its camera keys are user-configured, not necessarily
+        # "rgb*"/"depth*"-prefixed -- so image_keys must be passed explicitly.
+        # Reuses classifier_image_keys (same "which keys are cameras"
+        # question the classifier wrapper below already answers) with the
+        # same "every non-state key" fallback used there.
+        stack_image_keys = args.classifier_image_keys or tuple(
+            k for k in env.single_observation_space.spaces if k != "state"
+        )
+        env = ImageFrameStackWrapper(env, frame_stack=args.frame_stack, image_keys=stack_image_keys)
 
     if args.convert_obs_rotation:
         env = RotvecObsWrapper(env)
@@ -56,6 +71,12 @@ def _build_env(args, env_request):
 
     env = TeleopInterventionWrapper(env, device=args.teleop_device)
 
+    if args.use_grasp_penalty:
+        # Must wrap outside TeleopInterventionWrapper so
+        # info["intervene_action"] (the actually-executed action under
+        # human intervention) is already present when this runs.
+        env = GraspPenaltyWrapper(env, penalty=args.grasp_penalty_value)
+
     if args.fwbw:
         env = FWBWResetFreeWrapper(env)
 
@@ -74,6 +95,13 @@ def _run_actor(args) -> None:
 
     env_request = _hil_serl_env_request(args, run_name="real_world_actor")
     env = _build_env(args, env_request)
+    if args.record_video_dir is not None:
+        # Applied here (not inside _build_env) since it's actor-only --
+        # _build_env is shared by actor/learner/eval, and only the actor
+        # process ever calls env.step() against the real robot.
+        from rl_garden_real_world.envs.wrappers.video_recorder import VideoRecorderWrapper
+
+        env = VideoRecorderWrapper(env, save_dir=args.record_video_dir)
 
     if not args.fwbw:
         agent = _rebuild_scratch_agent_for_env(args, env)
@@ -281,6 +309,21 @@ class HilSerlArgs(RealWorldFrankaArgs, RLPDHybridArgs):
     classifier_checkpoint: Optional[str] = None
     classifier_threshold: float = 0.5
     classifier_image_keys: Sequence[str] = field(default_factory=tuple)
+
+    # Gripper-flip reward shaping added to RLPDHybrid's discrete critic
+    # target on top of the raw env reward (HIL-SERL's grasp_penalty) --
+    # see rl_garden_real_world/envs/wrappers/grasp_penalty.py.
+    use_grasp_penalty: bool = False
+    grasp_penalty_value: float = -0.05
+
+    # Records each actor-side episode to <record_video_dir>/episode_*.mp4
+    # via ffmpeg -- actor role only (see _run_actor). None disables it.
+    record_video_dir: Optional[str] = None
+
+    # Replay-buffer image-frame dedup (MemoryEfficientDictReplayBuffer) --
+    # only meaningful when frame_stack > 1; a memory-usage optimization,
+    # not a correctness change, for long image-heavy real-world sessions.
+    memory_efficient_buffer: bool = False
 
     teleop_device: Literal["pico", "spacemouse"] = "pico"
     # Converts FrankaRealEnv's raw quaternion state slice to a rotation

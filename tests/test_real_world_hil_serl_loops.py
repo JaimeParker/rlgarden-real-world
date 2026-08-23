@@ -106,6 +106,15 @@ def test_hil_serl_actor_loop_tags_intervened_from_info():
     assert loop._extra_transition_fields({}) == {"intervened": False}
 
 
+def test_hil_serl_actor_loop_forwards_grasp_penalty_when_present():
+    loop = HilSerlActorLoop.__new__(HilSerlActorLoop)
+    penalty = torch.tensor([-0.05])
+    fields = loop._extra_transition_fields({"grasp_penalty": penalty})
+    assert fields["intervened"] is False
+    torch.testing.assert_close(fields["grasp_penalty"], penalty)
+    assert "grasp_penalty" not in loop._extra_transition_fields({})
+
+
 def test_hil_serl_learner_loop_routes_by_intervened_flag(tmp_path):
     """Matches HIL-SERL's own actor loop (train_rlpd.py:178-193): every
     transition -- intervened or not -- goes into the online replay buffer;
@@ -123,6 +132,21 @@ def test_hil_serl_learner_loop_routes_by_intervened_flag(tmp_path):
     assert len(agent.replay_buffer) == 3
     assert len(agent.offline_replay_buffer) == 2
     assert loop.received_transitions == 3
+
+
+def test_hil_serl_learner_loop_strips_actor_id_before_buffer_and_snapshot(tmp_path):
+    agent = _agent()
+    agent.init_demo_buffer(buffer_size=16, demo_data_ratio=0.5)
+    loop = HilSerlLearnerLoop(agent, "127.0.0.1", 0, checkpoint_dir=str(tmp_path), buffer_period=1000)
+
+    loop._on_transition({**_transition(intervened=True), "actor_id": "robot_a"})
+    loop._on_transition({**_transition(intervened=False), "actor_id": "robot_b"})
+
+    assert loop.received_by_actor == {"robot_a": 1, "robot_b": 1}
+    # actor_id must never survive into the pending-snapshot lists (it would
+    # otherwise get pickled into crash-recovery buffer/demo_buffer files).
+    assert all("actor_id" not in t for t in loop._pending_online)
+    assert all("actor_id" not in t for t in loop._pending_demo)
 
 
 def test_hil_serl_learner_loop_snapshots_and_reloads_on_restart(tmp_path):

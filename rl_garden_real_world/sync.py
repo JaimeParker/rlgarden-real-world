@@ -126,6 +126,21 @@ class ActorSyncClient:
     loop only ever reads the cache, it never makes a network call itself.
     This is required for the actor to hold its fixed control frequency: a
     slow learner (e.g. mid gradient-step) must never stall robot control.
+
+    The push queue is bounded (``max_queue_size``, default 600 -- roughly
+    one minute of backlog at a 10Hz control loop) and drops the oldest
+    queued (not-yet-sent) transition when full, never blocking the caller:
+    a robot control loop cares about recency of what reaches the learner
+    more than completeness, and must never stall waiting for network I/O.
+    ``dropped_transitions`` exposes the running count so a silently-lossy
+    run is detectable rather than just quietly training on less data.
+
+    ``LearnerSyncServer`` has no per-client state -- multiple
+    ``ActorSyncClient`` instances (separate processes, e.g. one per robot)
+    can already push to and pull from one learner with no protocol changes.
+    ``actor_id``, when set, is stamped onto every pushed transition purely
+    for observability on the learner side (see ``LearnerLoop.received_by_actor``);
+    it carries no routing behavior.
     """
 
     def __init__(
@@ -133,12 +148,19 @@ class ActorSyncClient:
         learner_url: str,
         poll_interval: float = 1.0,
         timeout: float = 5.0,
+        max_queue_size: int = 600,
+        actor_id: Optional[str] = None,
     ) -> None:
         self._base_url = learner_url.rstrip("/")
         self._timeout = timeout
         self._poll_interval = poll_interval
+        self._actor_id = actor_id
 
-        self._queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._queue: "queue.Queue[Optional[dict[str, Any]]]" = queue.Queue(
+            maxsize=max_queue_size
+        )
+        self._dropped_lock = threading.Lock()
+        self._dropped = 0
         self._params_lock = threading.Lock()
         self._cached_version = -1
         self._cached_params: Optional[dict[str, Any]] = None
@@ -153,12 +175,33 @@ class ActorSyncClient:
 
     def stop(self) -> None:
         self._stop_event.set()
-        self._queue.put(None)  # unblock the push worker's queue.get()
+        self._put_dropping_oldest(None)  # unblock the push worker's queue.get()
         self._push_thread.join(timeout=5.0)
         self._poll_thread.join(timeout=5.0)
 
+    @property
+    def dropped_transitions(self) -> int:
+        with self._dropped_lock:
+            return self._dropped
+
+    def _put_dropping_oldest(self, item: Optional[dict[str, Any]]) -> None:
+        while True:
+            try:
+                self._queue.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    self._queue.get_nowait()  # discard oldest queued (unsent) item
+                except queue.Empty:
+                    pass  # push worker drained it concurrently; retry put
+                else:
+                    with self._dropped_lock:
+                        self._dropped += 1
+
     def push_transition(self, transition: dict[str, Any]) -> None:
-        self._queue.put(transition)
+        if self._actor_id is not None:
+            transition = {**transition, "actor_id": self._actor_id}
+        self._put_dropping_oldest(transition)
 
     def latest_policy_params(self) -> Optional[dict[str, Any]]:
         """Returns the most recently cached params, or ``None`` before the

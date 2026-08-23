@@ -102,6 +102,29 @@ def test_on_transition_passes_extra_kwargs_through():
     assert "discounts" in agent.replay_buffer.add_calls[0]
 
 
+def test_on_transition_strips_actor_id_before_reaching_buffer():
+    # actor_id is observability-only metadata -- DictReplayBuffer.add()/
+    # TensorReplayBuffer.add() have fixed signatures with no **kwargs, so a
+    # raw actor_id reaching .add() would TypeError.
+    agent = _FakeAgent()
+    loop = LearnerLoop(agent, "127.0.0.1", 0)
+    transition = _transition(0.0)
+    transition["actor_id"] = "robot_a"
+    loop._on_transition(transition)
+    assert "actor_id" not in agent.replay_buffer.add_calls[0]
+
+
+def test_received_by_actor_tallies_per_actor_and_unknown():
+    agent = _FakeAgent()
+    loop = LearnerLoop(agent, "127.0.0.1", 0)
+    loop._on_transition({**_transition(), "actor_id": "robot_a"})
+    loop._on_transition({**_transition(), "actor_id": "robot_a"})
+    loop._on_transition({**_transition(), "actor_id": "robot_b"})
+    loop._on_transition(_transition())  # no actor_id -- default client
+    assert loop.received_by_actor == {"robot_a": 2, "robot_b": 1, "unknown": 1}
+    assert loop.received_transitions == 4
+
+
 def test_run_waits_for_learning_starts_before_training():
     agent = _FakeAgent(learning_starts=3, utd=1.0)
     loop = LearnerLoop(agent, "127.0.0.1", 0, train_freq=1, publish_freq=1, idle_poll_interval=0.02)

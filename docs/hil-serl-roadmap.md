@@ -227,27 +227,22 @@ Now built as a third `hil_serl`-only role (kept out of the shared
   failure. Whether HIL-SERL's actual Franka envs also set `done=True` on
   timeout (which would make this moot in practice) was not verified.
 
-### 11. `grasp_penalty` reward-shaping term -- not yet migrated
+### 11. `grasp_penalty` reward-shaping term -- LANDED
 
-HIL-SERL's hybrid single/dual-arm SAC (`serl_launcher/agents/continuous/
-sac_hybrid_{single,dual}.py`) trains the discrete gripper critic against
-`rewards + grasp_penalty` (a shaping term discouraging unnecessary
-open/close actuation), sourced from `info["grasp_penalty"]` on the actor
-side. `RLPDHybrid._train_discrete_critic` (`rl_garden/algorithms/
-rlpd_hybrid.py`) trains against the raw environment reward only -- `info`
-never carries a `grasp_penalty` key anywhere in the `rl-garden` stack. This
-is an algorithm-fidelity gap (affects gripper-policy behavior), not an
-infrastructure gap.
-
-**Precision note**: `grasp_penalty` is not produced anywhere in the agent --
-it's produced by an *env wrapper*, `GripperPenaltyWrapper`/
-`DualGripperPenaltyWrapper` (`3rd_party/hil-serl/serl_robot_infra/
-franka_env/envs/wrappers.py:339-397`), a `gym.RewardWrapper` that penalizes
-unnecessary gripper open/close actuation and stashes the penalty in
-`info["grasp_penalty"]`; the agent-side critic loss then reads it off the
-batch. Both pieces are missing in `rl-garden`: no such wrapper exists in
-`rl_garden/envs/wrappers/`, and `RLPDHybrid._train_discrete_critic` has no
-parameter for it.
+Built: `rl_garden_real_world/envs/wrappers/grasp_penalty.py::GraspPenaltyWrapper`
+(ported from the task-specific `usb_pickup_insertion/wrapper.py::
+GripperPenaltyWrapper`, which is what HIL-SERL's own `train_rlpd.py`/
+`sac_hybrid_single.py` actually consume via `info["grasp_penalty"]` -- not
+the base `franka_env/envs/wrappers.py::GripperPenaltyWrapper`, which mutates
+`reward` directly and is never wired into the real training loop) sets
+`info["grasp_penalty"]` on a gripper open/close flip. `RLPDHybrid` gained a
+`use_grasp_penalty` constructor flag; when set, its replay buffer stores a
+`grasp_penalty` column (`DictReplayBuffer(store_grasp_penalty=True)`,
+`rl_garden/buffers/dict_buffer.py`) and `_train_discrete_critic`'s target
+becomes `(rewards + grasp_penalty) + ...`, matching HIL-SERL's formula.
+`HilSerlActorLoop._extra_transition_fields` forwards `grasp_penalty` from
+`info` to the pushed transition. New `HilSerlArgs` fields:
+`use_grasp_penalty`, `grasp_penalty_value`.
 
 ## Not Yet Migrated
 
@@ -270,25 +265,33 @@ because it isn't needed for `train_rlpd.py`-style HIL-SERL.
   picks up newly written data. Don't try to force growing demo data through
   the existing in-memory buffer interface.
 
-### 2. BC (behavior cloning) agent
+### 2. BC (behavior cloning) agent -- LANDED
 
-`3rd_party/hil-serl/serl_launcher/serl_launcher/agents/continuous/bc.py`'s
-`BCAgent` -- reuses the same actor network as SAC (`Policy` class) with a
-pure NLL loss, no critic. Confirmed via reading HIL-SERL's own code that BC
-is **never** combined with the online RLPD loss at training time (no BC
-regularization term, no weight-loading from a BC checkpoint into the SAC
-actor) -- it's used standalone, either for `train_bc.py`'s own pretraining
-runs or as the bootstrap policy for `train_hgdagger.py`. Since it's fully
-independent of everything landed so far, it can be added later as its own
-`rl_garden/algorithms/` addition without touching `RLPDHybrid`,
-`hil_serl.py`, or any of the loop/sync base classes.
+**Correction**: `rl_garden/algorithms/bc.py::BC` already existed and was
+already fully registered (an `OfflineRLAlgorithm`, pure NLL loss, no
+critic) by the time this item's original text was written -- the actual gap
+was only a real-world entrypoint, not the algorithm itself.
 
-**Note**: `rl_garden/algorithms/bc.py`'s `BCPolicy` hardwires a
-tanh-squashed Gaussian actor (`rl_garden/networks/actor_critic.py:93,184-186`
-via `SquashedGaussianActor`). HIL-SERL's own `BCAgent.create()` defaults to
-`tanh_squash_distribution=False` (`bc.py:143-145`) -- unsquashed by default.
-Only matters if/when BC gets wired into real-world training; currently both
-implementations are fully standalone, so this has no live effect.
+Now built: `rl_garden_real_world/training/bc.py::run_real_world_bc`. BC is
+structurally an offline-style training loop over a static demo dataset --
+unlike `serl`/`hil_serl`, it has no actor/learner HTTP split at all (no
+`sync.py`, no `LearnerLoop`/`ActorLoop`), since `BC` is an
+`OfflineRLAlgorithm`, not an `OffPolicyAlgorithm`. Demo pkls are loaded via a
+new shared helper, `rl_garden_real_world/training/_demo_loading.py::
+load_demo_pkls` (factored out of `HilSerlLearnerLoop._load_demo_datasets`,
+which now calls it too instead of duplicating the glob+pickle loop).
+
+Also landed, addressing the tanh-squash note below: `BCPolicy`/`BC` gained a
+`tanh_squash: bool = True` flag (default preserves existing behavior).
+`False` builds `UnsquashedGaussianActor` (`rl_garden/networks/
+actor_critic.py`) instead of `SquashedGaussianActor` -- motivated by a
+concrete correctness argument, not just matching HIL-SERL's
+`tanh_squash_distribution=False` default: tanh-squashed
+`evaluate_action_log_prob` on expert actions sitting at exactly the action
+bounds (which real Franka demos produce on a near-binary gripper dimension)
+is numerically degenerate, since the tanh Jacobian correction diverges at
+the boundary. `RealWorldBCArgs`/`BCArgs` (the sim/offline entrypoint too)
+both expose it.
 
 ### 3. Reward classifier training script + data-collection convention -- LANDED
 
@@ -497,32 +500,55 @@ caught:
   launch files default it to `true` (the correct value, since `rl-garden`
   only supports the Franka hand today), but implicit rather than explicit.
 
-### 13. Safety box only clamps position, not orientation
+### 13. Safety box only clamps position, not orientation -- LANDED (correction: already was)
 
-HIL-SERL's `FrankaEnv.clip_safety_box()`
-(`3rd_party/hil-serl/serl_robot_infra/franka_env/envs/franka_env.py:185-207`)
-clips both `xyz_bounding_box` and `rpy_bounding_box` (with special-cased
-wraparound handling for the first Euler angle). `FrankaRealEnv.step()`
-(`rl_garden/envs/franka_real/env.py`) only clips `target_pos` against
-`safety_low`/`safety_high`, and `FrankaRealEnvConfig.safety_box_low/high`
-(`config.py`) is a 3-tuple (position only) -- there is no software limit on
-end-effector orientation. A runaway policy action or aggressive human teleop
-input can rotate the end-effector to an arbitrary orientation with nothing
-to stop it.
+**Correction**: this item's original text was stale/inaccurate by the time
+of a later audit -- orientation clamping already existed.
+`FrankaRealEnvConfig` (`envs/franka_real/config.py`) has
+`safety_box_rpy_low`/`safety_box_rpy_high` (`Optional`, both-or-neither, off
+by default). `FrankaRealEnv._clip_orientation()` (`envs/franka_real/env.py`)
+converts to Euler `"xyz"`, clips the first angle by absolute value with sign
+preserved (the same wraparound special-case HIL-SERL's
+`clip_safety_box()` uses), clips the rest directly, and converts back --
+applied in `step()` whenever `safety_box_rpy_low` is set. Nothing to build;
+noted here only so this doesn't get re-flagged as a gap. The one real
+difference from HIL-SERL: orientation clamping is opt-in (`None` by
+default) rather than always-on.
 
-### 14. No quaternion-to-Euler/rotvec conversion on the observation side
+### 14. No quaternion-to-Euler/rotvec conversion on the observation side -- LANDED (correction: already was)
 
-HIL-SERL applies `Quat2EulerWrapper`/`Quat2R2Wrapper`
-(`3rd_party/hil-serl/serl_robot_infra/franka_env/envs/wrappers.py:103-144`)
-to convert `tcp_pose`'s quaternion component into Euler (or 6D
-rotation-matrix) form before it reaches the policy's observation space.
-`FrankaRealEnv._obs_from_state()` concatenates the raw quaternion directly
-into the flat state vector -- no such conversion wrapper exists anywhere in
-`rl_garden/envs/wrappers/`. The action side already uses rotvec deltas
-correctly (matching HIL-SERL's action convention); the observation side has
-not been brought in line.
+**Correction**: also already existed. `RotvecObsWrapper` converts
+`obs["state"]`'s quaternion slice to a 3D rotation vector (not Euler -- a
+deliberate, already-documented deviation: "HIL-SERL converts to Euler via
+`Quat2EulerWrapper` instead, but rotvec avoids Euler's gimbal-lock/wraparound
+special-casing and stays consistent with this repo's own action convention"),
+wired into `hil_serl.py::_build_env` behind `--convert_obs_rotation` (off by
+default). Nothing to build; noted here only so this doesn't get re-flagged.
+Moved from `rl_garden/envs/wrappers/rotvec_obs.py` to
+`rl_garden_real_world/envs/wrappers/rotvec_obs.py` during a later placement
+audit (it hardcodes `FrankaRealEnv`'s exact 20-dim state layout, so it never
+belonged in the general `rl_garden/` wrappers package -- its own test was
+already correctly in `real_world/tests/`).
 
-### 15. Missing `franka_env` wrapper variants: `HumanClassifierWrapper`, `MultiStageBinaryRewardClassifierWrapper`, `GripperCloseEnv`
+### 15. Missing `franka_env` wrapper variants: `HumanClassifierWrapper`, `MultiStageBinaryRewardClassifierWrapper`, `GripperCloseEnv` -- LANDED
+
+Built, batched-torch, following `RewardClassifierWrapper`'s convention:
+`HumanClassifierWrapper` (`rl_garden_real_world/envs/wrappers/
+human_classifier.py` -- lives in `real_world/`, not `rl_garden/`, since
+blocking `input()` is meaningless outside a live teleop session);
+`MultiStageBinaryRewardClassifierWrapper` (`rl_garden/envs/wrappers/
+multi_stage_classifier.py` -- shape-agnostic, no action-space assumptions,
+so it lives in the general `rl_garden/` wrappers package; each stage fires
+reward exactly once, `terminated` flips once all stages received);
+`GripperCloseEnv` (`rl_garden_real_world/envs/wrappers/gripper_close.py` --
+7D->6D action space, zero-pads back before forwarding, truncates
+`info["intervene_action"]` too. Originally landed under `rl_garden/`, moved
+here: the 7D/last-dim-is-gripper shape it asserts is `FrankaRealEnv`'s own
+action convention, not a generic one -- no ManiSkill/RoboTwin sim task uses
+it, unlike `MultiStageBinaryRewardClassifierWrapper`'s genuine
+shape-agnosticism).
+
+Original text below, left for context:
 
 `RewardClassifierWrapper` (`rl_garden/envs/wrappers/reward_classifier.py`,
 item 3 above) only covers HIL-SERL's simplest case,
@@ -577,7 +603,18 @@ pre-existing condition of the whole `franka_real` backend, not something
 this migration introduced) -- meaning no `hil_serl` run today has actual
 camera images without a cell-specific integration written by hand.
 
-### 18. No real-world rollout video recording
+### 18. No real-world rollout video recording -- LANDED
+
+Built: `rl_garden_real_world/envs/wrappers/video_recorder.py::
+VideoRecorderWrapper`, combining both upstream ideas (accumulates obs-stream
+frames like `VideoWrapper`, writes to disk on episode end like
+`VideoRecorder`). Pipes raw frames to an `ffmpeg` subprocess -- the same
+convention `rl_garden/envs/robotwin/adapter.py`'s eval-video logging already
+uses -- rather than adding an `imageio`/`tensorflow` dependency. Wired into
+`hil_serl.py::_run_actor` (actor role only) behind a new `record_video_dir`
+`HilSerlArgs` field.
+
+Original text below, left for context:
 
 HIL-SERL's `VideoRecorder`/`VideoWrapper`
 (`3rd_party/hil-serl/serl_launcher/serl_launcher/wrappers/{video_recorder,
@@ -588,28 +625,47 @@ simulation eval logging, unrelated). There is currently no way to record
 video of a real-robot `hil_serl`/`serl` rollout for after-the-fact
 debugging.
 
-### 19. Replay-buffer scalability gaps: no image-frame dedup, no bounded actor-transport queue
+### 19. Replay-buffer scalability gaps: no image-frame dedup, no bounded actor-transport queue -- LANDED
 
-Two `serl_launcher.data` mechanisms that don't affect correctness but do
-affect resource usage at scale have no `rl-garden` equivalent:
+Both pieces built:
 
-- **`pack_obs_and_next_obs` frame dedup**: HIL-SERL's
-  `MemoryEfficientReplayBuffer` (`3rd_party/hil-serl/serl_launcher/
-  serl_launcher/data/memory_efficient_replay_buffer.py`) stores each pixel
-  frame once per timestep and reconstructs stacked `obs`/`next_obs` via a
-  sliding window at sample time. `rl_garden/buffers/dict_buffer.py`'s
-  `DictReplayBuffer` allocates and writes fully separate `obs`/`next_obs`
-  arrays on every `add()` -- full duplication per image key. A real
-  memory-usage difference for long real-world sessions with image
-  observations, not a correctness issue.
-- **Bounded actor-side transport queue**: HIL-SERL's actor pushes into a
-  `QueuedDataStore(50000)` (`train_rlpd.py:507-508`), giving implicit
-  backpressure if the learner falls behind. `rl_garden/real_world/sync.py`'s
-  `ActorSyncClient` uses an unbounded `queue.Queue()` -- if the learner is
-  slow or down, the actor-side queue grows without limit instead of
-  applying HIL-SERL's implicit bound/backpressure.
+- **`pack_obs_and_next_obs` frame dedup**: new
+  `rl_garden/buffers/memory_efficient_dict_buffer.py::
+  MemoryEfficientDictReplayBuffer` (subclasses `DictReplayBuffer`). Stores
+  one frame per timestep per designated image key; reconstructs the
+  `(T, H, W, C)` stacked window at sample time via a torch-native windowed
+  gather (no NumPy `sliding_window_view`, staying GPU-resident). Edge-
+  replicates at episode boundaries (matching `ImageFrameStackWrapper`'s own
+  `reset()` behavior) rather than reject-sampling them; a per-slot episode-id
+  check guards the one genuine hazard (a stale, still-resident position
+  whose temporal neighbor has since been overwritten by a later episode --
+  verified by test to be reachable and correctly rejected, not just a
+  theoretical concern). Requires `ImageFrameStackWrapper` upstream in the env
+  wrapper stack; `add()` asserts this explicitly rather than silently
+  mis-shaping storage. Opt-in via `RLPDHybrid(memory_efficient_buffer=True,
+  ...)` / `HilSerlArgs.memory_efficient_buffer`.
+- **Bounded actor-side transport queue**: `ActorSyncClient` gained
+  `max_queue_size` (default 600, ~60s backlog at the default 10Hz control
+  loop) with drop-oldest-on-full semantics (never blocks the caller) and a
+  `dropped_transitions` counter for observability. `stop()`'s sentinel put
+  goes through the same non-blocking path (previously a plain blocking
+  `queue.put(None)`, which could hang forever against a full queue -- only a
+  latent risk before the queue became bounded, but fixed alongside it).
 
-### 20. Temporal observation stacking not wired into the real-world path
+### 20. Temporal observation stacking not wired into the real-world path -- LANDED
+
+`ImageFrameStackWrapper` (`rl_garden/envs/wrappers/frame_stack.py`) gained a
+generic (non-ManiSkill) path: an explicit `image_keys` constructor param
+(`FrankaRealEnv`'s camera keys are user-configured, not necessarily
+`rgb*`/`depth*`-prefixed) that derives the stacked `single_observation_space`
+directly from the space definition -- deliberately never calls `env.reset()`
+to seed it, since a construction-time side effect would physically move the
+robot. Wired into `hil_serl.py::_build_env`, immediately after
+`make_training_envs(...)`, gated on the existing `HilSerlArgs.frame_stack`
+field (already inherited from `RLPDHybridArgs` -- no duplicate field added).
+The ManiSkill (`image_keys=None`) path is untouched.
+
+Original text below, left for context:
 
 HIL-SERL's `ChunkingWrapper`
 (`3rd_party/hil-serl/serl_launcher/serl_launcher/wrappers/chunking.py`)

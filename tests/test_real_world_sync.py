@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import torch
 
@@ -85,3 +86,40 @@ def test_push_transition_survives_learner_being_down_temporarily():
         assert client.latest_policy_params() is None
     finally:
         client.stop()
+
+
+def test_push_transition_drops_oldest_when_queue_full():
+    # No server/threads needed -- push_transition() enqueues synchronously,
+    # so filling the bounded queue and inspecting it is deterministic.
+    client = ActorSyncClient("http://127.0.0.1:1", poll_interval=10.0, max_queue_size=4)
+    for seq in range(10):
+        client.push_transition({"seq": seq})
+
+    assert client._queue.qsize() == 4
+    assert client.dropped_transitions == 6
+    remaining_seqs = [t["seq"] for t in client._queue.queue if t is not None]
+    assert remaining_seqs == [6, 7, 8, 9]
+
+
+def test_stop_does_not_block_when_queue_full():
+    # Regression guard for the Item-1 fix: stop()'s sentinel used to be a
+    # plain blocking queue.put(None), which could hang forever against a
+    # full queue. The learner responds (with a small per-call delay so the
+    # queue genuinely backs up under max_queue_size=2), so nothing here
+    # depends on network-timeout behavior -- just that stop() returns fast.
+    def on_transition(transition):
+        time.sleep(0.05)
+
+    server, url = _start_server(on_transition)
+    client = ActorSyncClient(url, poll_interval=10.0, max_queue_size=2)
+    try:
+        client.start()
+        for seq in range(8):
+            client.push_transition({"seq": seq})
+
+        start = time.perf_counter()
+        client.stop()
+        elapsed = time.perf_counter() - start
+        assert elapsed < 3.0, f"stop() blocked for {elapsed:.2f}s with a full queue"
+    finally:
+        server.stop()
