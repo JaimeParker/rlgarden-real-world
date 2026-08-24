@@ -81,7 +81,7 @@ def _run_learner(args) -> None:
         log_keywords=args.log_keywords,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
-        wandb_group=args.wandb_group or args.env_id,
+        log_group=args.log_group or args.env_id,
     )
 
     env_request = _serl_env_request(args, run_name=run_name)
