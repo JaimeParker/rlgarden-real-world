@@ -5,6 +5,7 @@ running a robot or a training loop."""
 from __future__ import annotations
 
 import gymnasium as gym
+import pytest
 import torch
 from gymnasium import spaces
 from gymnasium.vector.utils import batch_space
@@ -213,6 +214,43 @@ def test_build_env_wraps_fwbw_outermost_when_fwbw_enabled(monkeypatch):
     from rl_garden.envs.wrappers.fwbw_reset_free import FWBWResetFreeWrapper
 
     assert isinstance(env, FWBWResetFreeWrapper)
+
+
+def _real_robot_args(**real_robot_overrides) -> HilSerlArgs:
+    import dataclasses
+
+    args = _base_args(env_backend="real_robot")
+    return dataclasses.replace(
+        args, real_robot=dataclasses.replace(args.real_robot, **real_robot_overrides)
+    )
+
+
+def _patch_real_robot_build(monkeypatch):
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs",
+        lambda backend, req: (_FakeEnv(), None),
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides", [dict(action_mode="joint_delta"), dict(gripper_in_action=False)]
+)
+def test_build_env_rejects_teleop_for_non_seven_dim_real_robot_action(monkeypatch, overrides):
+    _patch_real_robot_build(monkeypatch)
+    with pytest.raises(ValueError, match="requires real_robot.action_mode=cartesian_delta"):
+        _build_env(_real_robot_args(**overrides), env_request=None)
+
+
+def test_build_env_accepts_cartesian_delta_with_gripper_real_robot(monkeypatch):
+    _patch_real_robot_build(monkeypatch)
+    env = _build_env(_real_robot_args(), env_request=None)
+
+    from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
+
+    assert isinstance(env, TeleopInterventionWrapper)
 
 
 class _WristFakeEnv(_FakeEnv):

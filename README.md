@@ -15,6 +15,36 @@ Hardware/communication code lives in the sibling
 repo (extra: `robot-infra`); `franka_real`'s own coupling to it is HTTP/JSON
 only (`FrankaBridgeClient`), no shared Python types.
 
+## Running on hardware
+
+Prerequisite: the robot daemon runs on the robot PC (see the robot_infra
+README, [How to Start](../robot_infra/README.md#how-to-start)):
+
+```bash
+python -m robot_infra.server --config robot.yaml --bind 0.0.0.0:50051
+```
+
+Train (two processes, GPU machine and robot-side machine):
+
+```bash
+python examples/train_real_world.py serl --role learner ...
+python examples/train_real_world.py serl --role actor --env-backend real_robot \
+    --real-robot.remote ROBOT_PC:50051 --real-robot.num-joints 7 \
+    --real-robot.cameras wrist --real-robot.image-size 128 128 ...
+```
+
+Deploy a trained checkpoint (eval only):
+
+```bash
+python examples/deploy_real_robot.py --checkpoint runs/.../checkpoints/checkpoint_<step>.pt \
+    --algo rlpd --real-robot.remote ROBOT_PC:50051 --real-robot.num-joints 7 ...
+```
+
+RLinf: start from
+[`configs/rlinf/realworld_rlgarden_franka.yaml`](configs/rlinf/realworld_rlgarden_franka.yaml).
+The package must be importable in the Ray env-worker process, and RLinf kills
+any roscore running on the env node.
+
 **RLinf**: RLinf drives this package through Gymnasium registration, not
 through rl-garden's adapter. In an RLinf real-world config set the env block's
 `env_type: real` and `init_params.id:

@@ -395,3 +395,11 @@ def test_close_disconnects_and_task_description_defaults_empty(rig):
     env.close()
     assert not rig.robot.is_connected
     env.close()
+
+
+def test_last_observation_is_none_before_reset_and_dict_after(rig):
+    env = rig.env()
+    assert env.last_observation is None
+    env.reset()
+    assert set(env.last_observation) == {"state", "frames"}
+    env.close()

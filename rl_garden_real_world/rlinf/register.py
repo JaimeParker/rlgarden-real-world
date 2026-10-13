@@ -66,7 +66,7 @@ class RLinfEnvAdapter(gym.Wrapper):
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         _, info = self.env.reset(seed=seed, options=options)
-        return self.real_env._last_obs, info
+        return self.real_env.last_observation, info
 
     def step(self, action):
         # RealRobotEnv tolerates stepping past ``terminated``; RLinf relies on that (it owns
@@ -77,7 +77,7 @@ class RLinfEnvAdapter(gym.Wrapper):
             for key, value in info.items()
         }
         return (
-            self.real_env._last_obs,
+            self.real_env.last_observation,
             float(_first_scalar(reward)),
             bool(_first_scalar(terminated)),
             bool(_first_scalar(truncated)),

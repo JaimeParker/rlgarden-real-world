@@ -299,6 +299,11 @@ class RealRobotEnv(gym.Env):
             ) from None
         return np.asarray(Image.fromarray(frame).resize((width, height), Image.BILINEAR))
 
+    @property
+    def last_observation(self) -> Optional[dict]:
+        """Nested ``{"state", "frames"}`` dict from the latest reset/step, or None before reset."""
+        return self._last_obs
+
     def render(self):
         if self._last_obs is None or not self._last_obs["frames"]:
             return None

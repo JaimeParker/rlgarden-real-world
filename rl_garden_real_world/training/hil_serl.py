@@ -44,6 +44,15 @@ def _build_env(args, env_request):
     from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
     from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
 
+    if args.env_backend == "real_robot":
+        cfg = args.real_robot
+        if cfg.action_mode != "cartesian_delta" or not cfg.gripper_in_action:
+            raise ValueError(
+                "hil_serl teleop intervention requires real_robot.action_mode=cartesian_delta "
+                "with gripper_in_action=true (7-D action); got "
+                f"action_mode={cfg.action_mode!r}, gripper_in_action={cfg.gripper_in_action}"
+            )
+
     env, _ = make_training_envs(args.env_backend, env_request)
 
     if args.obs.frame_stack > 1:
