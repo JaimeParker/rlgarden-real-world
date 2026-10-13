@@ -118,3 +118,92 @@ def test_run_learner_builds_full_agent_and_starts_learner_loop(monkeypatch, tmp_
     assert captured["logger_closed"] is True
     assert captured["learner_loop_kwargs"]["host"] == "0.0.0.0"
     assert captured["learner_loop_kwargs"]["port"] == 6000
+
+
+# -- real_robot backend selection ---------------------------------------------------
+
+
+def test_serl_args_parse_real_robot_backend():
+    import tyro
+
+    args = tyro.cli(
+        SerlArgs,
+        args=[
+            "--env_backend", "real_robot",
+            "--real_robot.remote", "127.0.0.1:1",
+            "--real_robot.num-joints", "6",
+        ],
+    )
+    assert args.env_backend == "real_robot"
+    assert args.real_robot.remote == "127.0.0.1:1"
+    assert args.real_robot.num_joints == 6
+    assert args.resolve_backend_config() is args.real_robot
+
+
+def test_serl_default_env_request_is_franka_real():
+    import dataclasses
+
+    from rl_garden_real_world.envs.real_robot import RealRobotEnvConfig
+    from rl_garden_real_world.training._args import FrankaRealConfig
+    from rl_garden_real_world.training.serl import _serl_env_request
+
+    args = SerlArgs()
+    assert args.env_backend == "franka_real"
+    assert args.real_robot == RealRobotEnvConfig()
+    request = _serl_env_request(args, run_name="snapshot")
+    snapshot = {
+        f.name: getattr(request, f.name)
+        for f in dataclasses.fields(request)
+        if f.name not in ("observation", "eval_record_dir")
+    }
+    assert snapshot == {
+        "env_id": args.env_id,
+        "num_envs": args.num_envs,
+        "control_mode": args.control_mode,
+        "render_mode": args.render_mode,
+        "seed": args.seed,
+        "reward_scale": args.reward_scale,
+        "reward_bias": args.reward_bias,
+        "num_eval_envs": args.num_eval_envs,
+        "capture_video": args.capture_video,
+        "video_fps": args.video_fps,
+        "num_eval_steps": args.num_eval_steps,
+        "create_eval_env": True,
+        "backend_config": FrankaRealConfig(),
+    }
+    assert request.observation == args.obs
+
+
+def test_serl_actor_builds_real_robot_env_with_real_robot_config(monkeypatch):
+    from rl_garden_real_world.envs.real_robot import RealRobotEnvConfig
+
+    captured = {}
+
+    def _fake_make_training_envs(backend, req):
+        captured["backend"] = backend
+        captured["request"] = req
+        return _FakeEnv(), None
+
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs", _fake_make_training_envs
+    )
+    monkeypatch.setattr(
+        "rl_garden.training.online.rlpd.build_rlpd", lambda *a, **k: _FakeAgent()
+    )
+
+    class _FakeActorLoop:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr("rl_garden_real_world.serl.SerlActorLoop", _FakeActorLoop)
+
+    from rl_garden_real_world.training.serl import _run_actor
+
+    config = RealRobotEnvConfig(remote="127.0.0.1:1", num_joints=6)
+    _run_actor(SerlArgs(role="actor", env_backend="real_robot", real_robot=config))
+
+    assert captured["backend"] == "real_robot"
+    assert captured["request"].backend_config is config

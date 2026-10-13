@@ -53,6 +53,7 @@ class RealRobotEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"]}
 
     def __init__(self, config: RealRobotEnvConfig, *, robot: Any = None) -> None:
+        config.require_robot_source()
         self.config = config
         self.robot = robot if robot is not None else _build_robot(config)
         self.task_description: str = ""

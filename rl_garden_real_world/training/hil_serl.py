@@ -8,8 +8,19 @@ docs/superpowers/specs/2026-07-09-hil-serl-migration-design.md.
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import torch
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _state_starts_with_tcp_pose(args) -> bool:
+    """FrankaRealEnv's state always starts with tcp_pose; real_robot's follows state_fields."""
+    if args.env_backend != "real_robot":
+        return True
+    fields = args.real_robot.state_fields
+    return bool(fields) and fields[0] == "tcp_pose"
 
 
 def _hil_serl_env_request(args, run_name):
@@ -48,7 +59,14 @@ def _build_env(args, env_request):
         env = ImageFrameStackWrapper(env, frame_stack=args.obs.frame_stack, image_keys=stack_image_keys)
 
     if args.convert_obs_rotation:
-        env = RotvecObsWrapper(env)
+        if _state_starts_with_tcp_pose(args):
+            env = RotvecObsWrapper(env)
+        else:
+            _LOGGER.warning(
+                "convert_obs_rotation skipped: real_robot state_fields %s do not start with "
+                "tcp_pose, so there is no quaternion at state[3:7]",
+                list(args.real_robot.state_fields),
+            )
 
     if args.classifier_checkpoint is not None:
         from rl_garden.common.utils import get_device

@@ -18,8 +18,10 @@ field explicitly (e.g. ``SerlArgs.franka_real``), the same way
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
+
+from rl_garden_real_world.envs.real_robot.config import RealRobotEnvConfig
 
 
 @dataclass
@@ -38,7 +40,10 @@ class RealWorldFrankaArgs:
     train_freq: int = 1
     publish_freq: int = 100
 
-    env_backend: str = "franka_real"
+    # "franka_real" (FrankaRealEnv over the HTTP bridge, ``--franka_real.*``) or
+    # "real_robot" (any robot_infra robot, ``--real_robot.*``).
+    env_backend: Literal["franka_real", "real_robot"] = "franka_real"
+    real_robot: RealRobotEnvConfig = field(default_factory=RealRobotEnvConfig)
 
 
 @dataclass

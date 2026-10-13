@@ -15,15 +15,18 @@ Hardware/communication code lives in the sibling
 repo (extra: `robot-infra`); `franka_real`'s own coupling to it is HTTP/JSON
 only (`FrankaBridgeClient`), no shared Python types.
 
-**Critical invariant**: RLinf's real-world RL training goes through the
-identical `EnvWorker`/`EmbodiedSACFSDPPolicy` path as simulation (verified
-against RLinf source directly, see rl-garden's
-`docs/design/rlinf-integration.md`). As long as `franka_real` keeps
-satisfying rl-garden's `EnvBackend` api_version 2 contract exactly as it
-does today, rl-garden's existing RLinf Pattern-A adapter
-(`rl_garden/integrations/rlinf/{sac_actor,sac_rollout}.py`) can drive this
-env with zero real-robot-specific RLinf code. Don't break that contract
-when extending this package.
+**RLinf**: RLinf drives this package through Gymnasium registration, not
+through rl-garden's adapter. In an RLinf real-world config set the env block's
+`env_type: real` and `init_params.id:
+"rl_garden_real_world.rlinf.register:RLGardenReal-v0"`; RLinf's
+`RealWorldEnv` then `gym.make`s `RealRobotEnv` (one robot per env worker) with
+`override_cfg` as its config. See
+[`configs/rlinf/realworld_rlgarden_franka.yaml`](configs/rlinf/realworld_rlgarden_franka.yaml)
+for the env block and its hazards, and `tests/test_rlinf_registration.py` for
+the contract. rl-garden's Pattern-A RLinf adapter
+(`rl_garden/integrations/rlinf/{sac_actor,sac_rollout}.py`) runs RLinf's own
+env worker and has no real-robot or image path, so it cannot drive this
+package.
 
 Run training with `python examples/train_real_world.py serl --role ...`
 (see that file's module docstring for the two-process actor/learner launch

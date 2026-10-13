@@ -24,7 +24,8 @@ _SAFETY_BOX_LENGTH = 6
 @dataclass
 class RealRobotEnvConfig:
     # Exactly one of: a local robot_infra RobotConfig dict (must carry "type"),
-    # or the address of a robot_infra daemon.
+    # or the address of a robot_infra daemon. Checked by ``require_robot_source``
+    # when the env is built, so the default-constructed config (CLI group) stays valid.
     robot: Optional[dict] = None
     remote: Optional[str] = None
     token: Optional[str] = None
@@ -53,11 +54,6 @@ class RealRobotEnvConfig:
         self.cameras = list(self.cameras)
         if self.image_size is not None:
             self.image_size = tuple(self.image_size)
-        if (self.robot is None) == (self.remote is None):
-            raise ValueError(
-                "set exactly one of `robot` (local RobotConfig dict) or `remote` "
-                "(robot_infra daemon address)"
-            )
         if self.action_mode not in ACTION_MODES:
             raise ValueError(
                 f"action_mode {self.action_mode!r} invalid; choose from {list(ACTION_MODES)}"
@@ -107,4 +103,11 @@ class RealRobotEnvConfig:
         if self.max_episode_steps is not None and self.max_episode_steps <= 0:
             raise ValueError(
                 f"max_episode_steps must be positive or None, got {self.max_episode_steps}"
+            )
+
+    def require_robot_source(self) -> None:
+        if (self.robot is None) == (self.remote is None):
+            raise ValueError(
+                "set exactly one of `robot` (local RobotConfig dict) or `remote` "
+                "(robot_infra daemon address)"
             )

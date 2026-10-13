@@ -111,6 +111,16 @@ def test_resolve_config_requires_real_robot_config():
         RealRobotBackend.resolve_config(req, is_eval=False)
 
 
+@pytest.mark.parametrize("sources", [dict(robot=None), dict(remote="host:1")])
+def test_resolve_config_requires_exactly_one_robot_source(sources):
+    req = _req()
+    req.backend_config = RealRobotEnvConfig(
+        **{**dict(robot=FAKE_FRANKA, home_joints=[0.0] * 7), **sources}
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        RealRobotBackend.resolve_config(req, is_eval=False)
+
+
 def test_make_env_is_shared_flattened_and_returns_torch(built_envs):
     req = _req()
     env = RealRobotBackend.make_train_env(req)

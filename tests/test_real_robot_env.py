@@ -108,8 +108,6 @@ def _is_subsequence(expected: list[str], log: list[str]) -> bool:
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(), "exactly one"),
-        (dict(robot={"type": "franka"}, remote="host:1"), "exactly one"),
         (dict(action_mode="velocity"), "action_mode"),
         (dict(num_joints=0), "num_joints"),
         (dict(joint_limits=[[-1.0, 1.0]] * 6), "joint_limits"),
@@ -125,6 +123,21 @@ def test_config_validation_errors(kwargs, match):
         kwargs = {"robot": {"type": "franka"}, **kwargs}
     with pytest.raises(ValueError, match=match):
         RealRobotEnvConfig(**kwargs)
+
+
+def test_config_default_constructs_and_parses_from_empty_cli():
+    import tyro
+
+    assert RealRobotEnvConfig().robot is None
+    assert tyro.cli(RealRobotEnvConfig, args=[]) == RealRobotEnvConfig()
+
+
+@pytest.mark.parametrize(
+    "kwargs", [dict(), dict(robot={"type": "franka"}, remote="host:1")]
+)
+def test_env_requires_exactly_one_robot_source(kwargs):
+    with pytest.raises(ValueError, match="exactly one"):
+        RealRobotEnv(RealRobotEnvConfig(**kwargs), robot=object())
 
 
 def test_config_remote_with_cameras_requires_image_size():

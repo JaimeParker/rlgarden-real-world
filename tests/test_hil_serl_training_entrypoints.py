@@ -462,3 +462,84 @@ def test_run_eval_runs_deterministic_episodes_and_reports_success_rate(monkeypat
     assert captured["load_checkpoint"] == "/tmp/ckpt.pt"
     assert captured["checkpoint_dir"] is None
     assert fake_agent.policy.predict_calls == [True, True, True]
+
+
+# -- real_robot backend selection ---------------------------------------------------
+
+
+class _FakeDictStateEnv(_FakeEnv):
+    def __init__(self, state_dim: int = 10):
+        super().__init__()
+        self.single_observation_space = spaces.Dict(
+            {"state": spaces.Box(-1, 1, (state_dim,), dtype="float32")}
+        )
+        self.observation_space = batch_space(self.single_observation_space, 1)
+
+
+def _patch_backend(monkeypatch, captured):
+    def _fake_make_training_envs(backend, req):
+        captured["backend"] = backend
+        captured["request"] = req
+        return _FakeDictStateEnv(), None
+
+    monkeypatch.setattr(
+        "rl_garden.envs.backend_registry.make_training_envs", _fake_make_training_envs
+    )
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+
+
+def _rotvec_in_chain(env) -> bool:
+    from rl_garden_real_world.envs.wrappers.rotvec_obs import RotvecObsWrapper
+
+    while env is not None:
+        if isinstance(env, RotvecObsWrapper):
+            return True
+        env = getattr(env, "env", None)
+    return False
+
+
+def test_build_env_real_robot_backend_receives_real_robot_config(monkeypatch):
+    from rl_garden_real_world.envs.real_robot import RealRobotEnvConfig
+    from rl_garden_real_world.training.hil_serl import _hil_serl_env_request
+
+    captured = {}
+    _patch_backend(monkeypatch, captured)
+    args = _base_args(
+        env_backend="real_robot", real_robot=RealRobotEnvConfig(remote="127.0.0.1:1", num_joints=6)
+    )
+    _build_env(args, _hil_serl_env_request(args, run_name="t"))
+
+    assert captured["backend"] == "real_robot"
+    assert captured["request"].backend_config is args.real_robot
+
+
+def test_build_env_real_robot_applies_rotvec_only_when_state_starts_with_tcp_pose(
+    monkeypatch, caplog
+):
+    from rl_garden_real_world.envs.real_robot import RealRobotEnvConfig
+
+    _patch_backend(monkeypatch, {})
+    tcp_first = _base_args(
+        env_backend="real_robot",
+        convert_obs_rotation=True,
+        real_robot=RealRobotEnvConfig(remote="h:1", state_fields=("tcp_pose", "gripper_pos")),
+    )
+    assert _rotvec_in_chain(_build_env(tcp_first, env_request=None))
+
+    joints_only = _base_args(
+        env_backend="real_robot",
+        convert_obs_rotation=True,
+        real_robot=RealRobotEnvConfig(remote="h:1", state_fields=("joint_pos",)),
+    )
+    with caplog.at_level("WARNING"):
+        assert not _rotvec_in_chain(_build_env(joints_only, env_request=None))
+    assert "convert_obs_rotation skipped" in caplog.text
+
+
+def test_build_env_franka_real_rotvec_unchanged(monkeypatch):
+    captured = {}
+    _patch_backend(monkeypatch, captured)
+    assert _rotvec_in_chain(_build_env(_base_args(convert_obs_rotation=True), env_request=None))
+    assert captured["backend"] == "franka_real"

@@ -42,6 +42,7 @@ class RealRobotBackend(EnvBackend):
                 "real_robot backend needs req.backend_config to be a RealRobotEnvConfig "
                 f"(with `robot` or `remote` set), got {type(config).__name__}"
             )
+        config.require_robot_source()
         observation = req.observation
         unsupported = {
             "depth": observation.depth,
