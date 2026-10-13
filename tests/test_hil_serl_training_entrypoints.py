@@ -37,7 +37,7 @@ class _FakeEnv(gym.Env):
 
     def __init__(self):
         self.single_observation_space = spaces.Box(-1, 1, (4,), dtype="float32")
-        self.single_action_space = spaces.Box(-1, 1, (3,), dtype="float32")
+        self.single_action_space = spaces.Box(-1, 1, (7,), dtype="float32")
         self.observation_space = batch_space(self.single_observation_space, 1)
         self.action_space = batch_space(self.single_action_space, 1)
 
@@ -233,15 +233,6 @@ def _patch_real_robot_build(monkeypatch):
     monkeypatch.setattr(
         "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
     )
-
-
-@pytest.mark.parametrize(
-    "overrides", [dict(action_mode="joint_delta"), dict(gripper_in_action=False)]
-)
-def test_build_env_rejects_teleop_for_non_seven_dim_real_robot_action(monkeypatch, overrides):
-    _patch_real_robot_build(monkeypatch)
-    with pytest.raises(ValueError, match="requires real_robot.action_mode=cartesian_delta"):
-        _build_env(_real_robot_args(**overrides), env_request=None)
 
 
 def test_build_env_accepts_cartesian_delta_with_gripper_real_robot(monkeypatch):
@@ -581,3 +572,120 @@ def test_build_env_franka_real_rotvec_unchanged(monkeypatch):
     _patch_backend(monkeypatch, captured)
     assert _rotvec_in_chain(_build_env(_base_args(convert_obs_rotation=True), env_request=None))
     assert captured["backend"] == "franka_real"
+
+
+# -- --teleop-device robot and real_robot frame stacking ------------------------------
+
+
+@pytest.fixture
+def _fake_robot_claims(tmp_path, monkeypatch):
+    import robot_infra.devices.claims as claims
+
+    monkeypatch.setattr(claims, "_DEFAULT_LOCK_DIR", tmp_path / "claims")
+
+
+def _fake_robot_args(*, frame_stack=1, teleop=None, **overrides) -> HilSerlArgs:
+    from rl_garden_real_world.envs.real_robot import RealRobotEnvConfig
+
+    robot = {
+        "type": "franka",
+        "arm_backend": "fake",
+        "gripper": {"backend": "fake"},
+        "cameras": [{"name": "wrist", "backend": "fake", "width": 32, "height": 24, "fps": 60}],
+    }
+    if teleop is not None:
+        robot["teleop"] = teleop
+    return _base_args(
+        env_backend="real_robot",
+        obs=ObservationConfig(state=True, rgb=("wrist",), frame_stack=frame_stack),
+        real_robot=RealRobotEnvConfig(
+            robot=robot, home_joints=[0.0] * 7, reset_settle_s=0.0, control_hz=1000.0
+        ),
+        **overrides,
+    )
+
+
+def _chain(env) -> list:
+    layers = []
+    while env is not None:
+        layers.append(env)
+        env = vars(env).get("env") if hasattr(env, "__dict__") else None
+    return layers
+
+
+def test_build_env_robot_teleop_device_wraps_teleop_part_source_in_order(_fake_robot_claims):
+    import rl_garden_real_world.envs.backends.real_robot  # noqa: F401  (registers the backend)
+    from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
+    from rl_garden_real_world.envs.real_robot import RealRobotVectorEnv
+    from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
+    from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
+    from rl_garden_real_world.envs.wrappers.teleop_sources import TeleopPartSource
+    from rl_garden_real_world.training.hil_serl import _hil_serl_env_request
+
+    args = _fake_robot_args(
+        frame_stack=2,
+        teleop={"name": "leader", "backend": "fake"},
+        teleop_device="robot",
+        use_grasp_penalty=True,
+    )
+    env = _build_env(args, _hil_serl_env_request(args, run_name="t"))
+    try:
+        types = [type(layer) for layer in _chain(env)]
+        assert types[:3] == [GraspPenaltyWrapper, TeleopInterventionWrapper, ImageFrameStackWrapper]
+        assert RealRobotVectorEnv in types
+        assert isinstance(env.env.teleop, TeleopPartSource)
+    finally:
+        env.close()
+
+
+def test_robot_teleop_device_requires_real_robot_backend():
+    from rl_garden_real_world.training.hil_serl import _robot_teleop_kwargs
+
+    with pytest.raises(ValueError, match="real_robot"):
+        _robot_teleop_kwargs(_base_args(teleop_device="robot"))
+
+
+def test_robot_teleop_declaration_comes_from_args():
+    from rl_garden_real_world.training.hil_serl import _robot_teleop_kwargs
+
+    args = _real_robot_args(action_mode="joint_delta", num_joints=6)
+    assert "teleop_contract" not in _robot_teleop_kwargs(args)
+    import dataclasses
+
+    declared = dataclasses.replace(
+        args, robot_teleop_action_mode="joint_delta", robot_teleop_has_gripper=False
+    )
+    kwargs = _robot_teleop_kwargs(declared)
+    assert kwargs["teleop_contract"] == ("joint_delta", 6, False)
+    assert kwargs["joint_scale_rad"] == args.real_robot.joint_scale_rad
+
+
+def test_real_robot_frame_stack_is_stacked_by_the_wrapper_not_the_backend(
+    _fake_robot_claims, monkeypatch
+):
+    import rl_garden_real_world.envs.backends.real_robot  # noqa: F401  (registers the backend)
+
+    monkeypatch.setattr(
+        "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
+    )
+    from rl_garden_real_world.training.hil_serl import _hil_serl_env_request
+
+    args = _fake_robot_args(frame_stack=2)
+    request = _hil_serl_env_request(args, run_name="t")
+    assert request.observation.frame_stack == 1
+    assert args.obs.frame_stack == 2
+    env = _build_env(args, request)
+    try:
+        obs, _ = env.reset()
+        assert obs["rgb_wrist"].shape == (1, 2, 24, 32, 3)
+        assert env.single_observation_space["rgb_wrist"].shape == (2, 24, 32, 3)
+    finally:
+        env.close()
+
+
+def test_franka_real_request_keeps_frame_stack():
+    import rl_garden_real_world.envs.backends.franka_real  # noqa: F401  (registers the backend)
+    from rl_garden_real_world.training.hil_serl import _hil_serl_env_request
+
+    args = _base_args(obs=ObservationConfig(state=True, rgb=("wrist",), frame_stack=2))
+    assert _hil_serl_env_request(args, run_name="t").observation.frame_stack == 2

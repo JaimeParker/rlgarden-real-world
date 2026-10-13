@@ -40,10 +40,15 @@ class RealRobotEnvConfig:
     xyz_scale_m: float = 0.02
     rot_scale_rad: float = 0.1
     joint_scale_rad: float = 0.05
+    # The source of truth for limits is the robot yaml on the robot PC (enforced by the
+    # device layer). The three fields below are optional and may only be tighter than it:
+    # unset ones are inherited after connect, looser ones fail the first reset.
     # [xmin, ymin, zmin, xmax, ymax, zmax]; clips the cartesian target position.
     safety_box: Optional[list[float]] = None
-    # One [low, high] pair per joint; clips joint targets, required by joint_abs.
+    # One [low, high] pair per joint; clips joint targets. joint_abs still needs it set here
+    # because the action mapping is built at construction, before any connection.
     joint_limits: Optional[list[list[float]]] = None
+    # Reset pose; falls back to the robot's own home_joints when unset.
     home_joints: Optional[list[float]] = None
     gripper_in_action: bool = True
     max_episode_steps: Optional[int] = None

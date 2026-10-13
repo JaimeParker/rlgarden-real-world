@@ -9,12 +9,18 @@ eval loader): the online registry's ``<algo>`` Args are filled from the run's ``
 ``metadata.hyperparameters``, the agent is rebuilt with ``build_<algo>`` against the deploy
 env's spaces, and ``BaseAlgorithm.load`` restores the weights (no replay, no optimizers).
 Checkpoint/space mismatches therefore surface before the robot moves (nothing connects until
-the first ``reset``). The env is the bare backend env: training-time observation wrappers
-(HIL-SERL frame stacking / rotvec conversion) are not re-applied.
+the first ``reset``).
+
+The training run is the source of truth for the action/observation contract: the env is built
+from the run's ``real_robot`` config (``resolve_deploy_robot_config``; the CLI only supplies
+connection fields and an explicit, conflicting contract field is an error) and the
+training-time observation wrappers (HIL-SERL frame stacking / rotvec conversion) are re-applied.
+Training-only wrappers (teleop intervention, classifier, grasp penalty, FWBW) are not.
 """
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
@@ -29,6 +35,23 @@ _BACKEND = "real_robot"
 # Inverse of rl_garden.common.effective_config.json_value's non-finite float encoding.
 _JSON_FLOAT_SENTINELS = {"Infinity": float("inf"), "-Infinity": float("-inf"), "NaN": float("nan")}
 DEVICE_ERROR_EXIT_CODE = 2
+_LOGGER = logging.getLogger(__name__)
+# Fields that define what the policy's actions and observations mean: the training run decides.
+# Everything else on RealRobotEnvConfig (robot, remote, token, home_joints, cameras, safety_box,
+# reset_settle_s) describes this deployment's connection and stays under CLI control.
+_CONTRACT_FIELDS = (
+    "action_mode",
+    "gripper_in_action",
+    "num_joints",
+    "joint_limits",
+    "xyz_scale_m",
+    "rot_scale_rad",
+    "joint_scale_rad",
+    "state_fields",
+    "image_size",
+    "control_hz",
+    "max_episode_steps",
+)
 
 
 @dataclass
@@ -112,7 +135,9 @@ def restore_training_args(args: DeployArgs) -> Any:
     config_path = _config_path(args)
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        _apply_mapping(training_args, config.get("inputs", config.get("args", config)))
+        saved = config.get("inputs", config.get("args", config))
+        _apply_mapping(training_args, saved)
+        _restore_real_world_fields(training_args, saved)
     checkpoint = load_checkpoint_file(args.checkpoint, map_location="cpu")
     hyperparameters = checkpoint.get("metadata", {}).get("hyperparameters", {})
     if isinstance(hyperparameters, Mapping):
@@ -142,25 +167,86 @@ def restore_training_args(args: DeployArgs) -> Any:
     return training_args
 
 
+def _restore_real_world_fields(training_args: Any, saved: Mapping[str, Any]) -> None:
+    """Attach the real-world-only training fields the online ``<algo>`` Args do not declare.
+
+    ``real_robot`` is attached only for ``env_backend == "real_robot"`` runs (franka_real runs
+    persist a default, meaningless ``real_robot``); ``convert_obs_rotation`` and
+    ``classifier_image_keys`` (the frame-stacked camera keys) come from hil_serl.
+    """
+    saved_robot = saved.get("real_robot")
+    if saved.get("env_backend") == _BACKEND and isinstance(saved_robot, Mapping):
+        names = {f.name for f in fields(RealRobotEnvConfig)}
+        training_args.real_robot = RealRobotEnvConfig(
+            **{k: v for k, v in saved_robot.items() if k in names}
+        )
+    if "convert_obs_rotation" in saved:
+        training_args.convert_obs_rotation = bool(saved["convert_obs_rotation"])
+    if "classifier_image_keys" in saved:
+        training_args.classifier_image_keys = tuple(saved["classifier_image_keys"] or ())
+
+
+def resolve_deploy_robot_config(args: DeployArgs, training_args: Any) -> RealRobotEnvConfig:
+    """The deploy ``RealRobotEnvConfig``: contract fields from training, connection fields from the CLI.
+
+    A contract field counts as given on the CLI when it differs from the dataclass default; a
+    given value that also differs from the training run's is a ``ValueError``. Runs without a
+    ``real_robot`` config fall back to the CLI config entirely (with a warning).
+    """
+    cli = args.real_robot
+    trained = getattr(training_args, "real_robot", None)
+    if trained is None:
+        _LOGGER.warning(
+            "training config has no real_robot section (older run or franka_real); using the "
+            "--real_robot.* CLI config as is, so action/observation contract is NOT verified"
+        )
+        return cli
+    defaults = RealRobotEnvConfig()
+    conflicts = [
+        f"{name}: training={getattr(trained, name)!r}, cli={getattr(cli, name)!r}"
+        for name in _CONTRACT_FIELDS
+        if getattr(cli, name) != getattr(defaults, name) and getattr(cli, name) != getattr(trained, name)
+    ]
+    if conflicts:
+        raise ValueError(
+            "--real_robot.* contradicts the training run's real_robot config; the training run "
+            "is the source of truth for these fields (drop them from the CLI):\n  "
+            + "\n  ".join(conflicts)
+        )
+    return replace(cli, **{name: getattr(trained, name) for name in _CONTRACT_FIELDS})
+
+
 def build_deploy_env(args: DeployArgs, training_args: Any):
     """The real_robot env with the observation layout the policy was trained on."""
+    import dataclasses
+
     import rl_garden_real_world.envs.backends.real_robot  # noqa: F401  (registers the backend)
     from rl_garden.envs.backend_registry import EnvRequest, make_training_envs
     from rl_garden.observations import ObservationConfig
+    from rl_garden_real_world.envs.wrappers._obs_chain import apply_obs_chain, tcp_pose_quat_slice
 
+    robot_config = resolve_deploy_robot_config(args, training_args)
+    observation = getattr(training_args, "obs", None) or ObservationConfig()
     request = EnvRequest(
         env_id=getattr(training_args, "env_id", "real_robot"),
         num_envs=1,
-        observation=getattr(training_args, "obs", None) or ObservationConfig(),
+        # The backend cannot stack frames; the stacking wrapper below does.
+        observation=dataclasses.replace(observation, frame_stack=1),
         control_mode="",
         render_mode="rgb_array",
         seed=args.seed,
         num_eval_envs=1,
         create_eval_env=False,
-        backend_config=args.real_robot,
+        backend_config=robot_config,
     )
     env, _ = make_training_envs(_BACKEND, request)
-    return env
+    return apply_obs_chain(
+        env,
+        frame_stack=observation.frame_stack,
+        image_keys=tuple(getattr(training_args, "classifier_image_keys", ())),
+        convert_obs_rotation=bool(getattr(training_args, "convert_obs_rotation", False)),
+        quat_slice=tcp_pose_quat_slice(robot_config),
+    )
 
 
 def restore_policy(args: DeployArgs, training_args: Any, env: Any):

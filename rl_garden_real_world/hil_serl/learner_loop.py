@@ -35,11 +35,16 @@ from __future__ import annotations
 import glob
 import os
 import pickle
-from typing import Any, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
 from rl_garden.algorithms.off_policy import OffPolicyAlgorithm
+from rl_garden_real_world.action_contract import (
+    read_contract_sidecar,
+    validate_transitions_against_contract,
+    write_contract_sidecar,
+)
 from rl_garden_real_world.learner_loop import _TRANSITION_TENSOR_KEYS, LearnerLoop
 from rl_garden_real_world.training._demo_loading import as_dict_observation, load_demo_pkls
 
@@ -56,8 +61,12 @@ class HilSerlLearnerLoop(LearnerLoop):
         train_freq: int = 1,
         publish_freq: int = 100,
         idle_poll_interval: float = 0.1,
+        action_contract: Optional[Mapping[str, Any]] = None,
     ) -> None:
         super().__init__(agent, host, port, train_freq, publish_freq, idle_poll_interval)
+        # ``action_contract.DEMO_CONTRACT_KEYS`` of the env; None (contract-less backends)
+        # skips snapshot/demo action checks and writes no sidecars.
+        self._action_contract = action_contract
         self._checkpoint_dir = checkpoint_dir
         self._buffer_period = buffer_period
         self._pending_online: list[dict[str, Any]] = []
@@ -71,7 +80,12 @@ class HilSerlLearnerLoop(LearnerLoop):
         # gates LearnerLoop.run()'s learning_starts wait, and HIL-SERL's own
         # analogous gate (`len(replay_buffer) < training_starts`) only ever
         # counts the online buffer, never `--demo_path` preload.
-        load_demo_pkls(paths, self.agent.add_demo_transition, self.agent.buffer_device)
+        load_demo_pkls(
+            paths,
+            self.agent.add_demo_transition,
+            self.agent.buffer_device,
+            expected_contract=self._action_contract,
+        )
 
     def _reload_snapshots(self) -> None:
         device = self.agent.buffer_device
@@ -88,6 +102,12 @@ class HilSerlLearnerLoop(LearnerLoop):
             for pkl_path in sorted(glob.glob(os.path.join(directory, "*.pkl"))):
                 with open(pkl_path, "rb") as f:
                     transitions = pickle.load(f)
+                validate_transitions_against_contract(
+                    transitions,
+                    self._action_contract,
+                    source=pkl_path,
+                    saved=read_contract_sidecar(pkl_path),
+                )
                 for transition in transitions:
                     self._add_transition(adder, transition, device)
                     if count_received:
@@ -140,10 +160,12 @@ class HilSerlLearnerLoop(LearnerLoop):
         os.makedirs(buffer_dir, exist_ok=True)
         os.makedirs(demo_dir, exist_ok=True)
         step = self._received
-        with open(os.path.join(buffer_dir, f"transitions_{step}.pkl"), "wb") as f:
-            pickle.dump(self._pending_online, f)
-        with open(os.path.join(demo_dir, f"transitions_{step}.pkl"), "wb") as f:
-            pickle.dump(self._pending_demo, f)
+        for directory, pending in ((buffer_dir, self._pending_online), (demo_dir, self._pending_demo)):
+            pkl_path = os.path.join(directory, f"transitions_{step}.pkl")
+            with open(pkl_path, "wb") as f:
+                pickle.dump(pending, f)
+            if self._action_contract is not None:
+                write_contract_sidecar(pkl_path, self._action_contract)
         self._pending_online = []
         self._pending_demo = []
         self._step_since_snapshot = 0

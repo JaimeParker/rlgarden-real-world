@@ -25,6 +25,7 @@ def run_real_world_bc(args: "RealWorldBCArgs") -> None:
     from rl_garden.envs.backend_registry import make_training_envs
     from rl_garden.training.offline._runner import _eval_env_request
     from rl_garden.training.offline.bc import build_bc
+    from rl_garden_real_world.action_contract import demo_contract_of
     from rl_garden_real_world.training._demo_loading import load_demo_pkls
 
     seed_everything(args.seed)
@@ -58,7 +59,12 @@ def run_real_world_bc(args: "RealWorldBCArgs") -> None:
     env, _ = make_training_envs(args.env_backend, env_request)
 
     agent = build_bc(args, env, logger, eval_env=None)
-    loaded = load_demo_pkls(args.demo_dataset_paths, agent.replay_buffer.add, agent.buffer_device)
+    loaded = load_demo_pkls(
+        args.demo_dataset_paths,
+        agent.replay_buffer.add,
+        agent.buffer_device,
+        expected_contract=demo_contract_of(env),
+    )
     if loaded == 0:
         raise ValueError(
             f"No demo transitions loaded from demo_dataset_paths={args.demo_dataset_paths!r}."

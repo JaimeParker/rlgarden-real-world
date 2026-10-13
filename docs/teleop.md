@@ -76,6 +76,16 @@ To add a new teleoperation device:
 
 The rest of the twist computation should stay shared.
 
+### Robot Teleop Part (`--teleop-device robot`)
+
+hil_serl on `--env-backend real_robot` can also take interventions from the teleop part of
+the robot itself (the robot yaml's `teleop:` section: spacemouse or the `fake` backend; no
+leader-arm backend exists yet, served locally or by the robot daemon). `TeleopPartSource`
+(`rl_garden_real_world/envs/wrappers/teleop_sources.py`) adapts it to the same
+`TeleOpSample` output, mapping cartesian or joint (`joint_abs`/`joint_delta`) teleop actions
+into the env's `[-1, 1]` action space; see the README's "Action contract" and "Teleop (`--teleop-device robot`)"
+sections for the mapping, the `--robot-teleop-action-mode` declaration and an example yaml.
+
 ## Basic Usage
 
 Visual teleoperation:

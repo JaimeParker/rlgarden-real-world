@@ -23,6 +23,9 @@ from rl_garden_real_world.envs.real_robot.config import RealRobotEnvConfig
 
 _CARTESIAN_ACTION_DIM = 6
 _GRIPPER_OPEN_COMMAND = 1.0
+_SAFETY_TOLERANCE = 1e-9
+# Reading safety_clips costs a daemon round trip on a RemoteRobot, so it is refreshed sparsely.
+_SAFETY_CLIPS_REFRESH_STEPS = 10
 
 
 def _state_field_shape(field: str, num_joints: int) -> tuple[int, ...]:
@@ -88,6 +91,12 @@ class RealRobotEnv(gym.Env):
             if config.joint_limits is not None
             else None
         )
+        # Effective limits: the env config, tightened/inherited from the device layer on connect.
+        self._effective_safety_box = (
+            np.asarray(config.safety_box, dtype=np.float64) if config.safety_box is not None else None
+        )
+        self._device_max_delta: Optional[dict] = None
+        self._safety_clips: Optional[int] = None
         self._period_s = 1.0 / config.control_hz
         self._validated = False
         self._last_raw: Optional[dict] = None
@@ -154,17 +163,69 @@ class RealRobotEnv(gym.Env):
                 f"robot has no cameras {unknown_cams} (available: {sorted(robot.cameras)})",
                 "fix the camera names in the env config",
             )
+        self._merge_device_safety(arm, fault)
+        # joint_abs maps each action onto an absolute target, so consecutive actions can jump
+        # across the whole joint range; only the device-layer step limit bounds that.
+        if config.action_mode == "joint_abs" and not (self._device_max_delta or {}).get("joint_rad"):
+            raise fault(
+                "action_mode joint_abs needs the robot's per-step joint limit, but the robot "
+                "reports no max_delta_per_step.joint_rad",
+                "set max_delta_per_step: {joint_rad: ...} in the robot yaml on the robot PC "
+                "(and run a daemon that reports its safety limits)",
+            )
+
+    def _merge_device_safety(self, arm, fault) -> None:
+        """Inherit the device layer's box/joint limits; an env limit looser than it is a fault."""
+        device = getattr(arm, "safety_limits", None)  # None: no limits, or a daemon predating them
+        if device is None:
+            return
+        self._device_max_delta = device.get("max_delta_per_step")
+        hint = (
+            "tighten the env safety_box/joint_limits, or loosen the robot yaml on the robot PC"
+        )
+
+        device_box = device.get("safety_box")
+        if device_box is not None:
+            device_box = np.asarray(device_box, dtype=np.float64)
+            env_box = self._effective_safety_box
+            if env_box is None:
+                self._effective_safety_box = device_box
+            elif np.any(env_box[:3] < device_box[:3] - _SAFETY_TOLERANCE) or np.any(
+                env_box[3:] > device_box[3:] + _SAFETY_TOLERANCE
+            ):
+                raise fault(
+                    f"env safety_box {env_box.tolist()} is looser than the robot's "
+                    f"{device_box.tolist()}",
+                    hint,
+                )
+
+        device_limits = device.get("joint_limits")
+        if device_limits is not None:
+            device_limits = np.asarray(device_limits, dtype=np.float64)
+            env_limits = self._joint_limits
+            if env_limits is None:
+                self._joint_limits = device_limits
+            elif np.any(env_limits[:, 0] < device_limits[:, 0] - _SAFETY_TOLERANCE) or np.any(
+                env_limits[:, 1] > device_limits[:, 1] + _SAFETY_TOLERANCE
+            ):
+                raise fault(
+                    f"env joint_limits {env_limits.tolist()} are looser than the robot's "
+                    f"{device_limits.tolist()}",
+                    hint,
+                )
 
     def _home_joints(self) -> np.ndarray:
         from robot_infra.devices.errors import DeviceFault
 
         home = self.config.home_joints
         if home is None:
+            home = getattr(self.robot.arm, "home_joints", None)  # RemoteArm, from describe
+        if home is None:
             home = getattr(self.robot.config, "home_joints", None)
         if home is None:
             raise DeviceFault(
                 "no home joint configuration for reset",
-                hint="set home_joints in the env config",
+                hint="set home_joints in the env config or the robot yaml",
                 device=self.robot.name,
             )
         return np.asarray(home, dtype=np.float64)
@@ -203,6 +264,7 @@ class RealRobotEnv(gym.Env):
         raw = self.robot.get_observation()
         self._elapsed_steps = 0
         self._last_send_time = None
+        self._refresh_safety_clips()
         return self._observe(raw), {}
 
     def step(self, action):
@@ -229,15 +291,27 @@ class RealRobotEnv(gym.Env):
             self.config.max_episode_steps is not None
             and self._elapsed_steps >= self.config.max_episode_steps
         )
+        if self._elapsed_steps % _SAFETY_CLIPS_REFRESH_STEPS == 0:
+            self._refresh_safety_clips()
         client = getattr(self.robot, "client", None)
         info = {
             "tcp_pose": np.asarray(raw["arm"]["tcp_pose"], dtype=np.float32).copy()
             if "tcp_pose" in raw["arm"]
             else None,
             "rtt_ms": getattr(client, "last_rtt_ms", None),
+            "safety_clips": self._safety_clips,
             "elapsed_steps": self._elapsed_steps,
         }
         return obs, 0.0, False, bool(truncated), info
+
+    def _refresh_safety_clips(self) -> None:
+        """Cumulative device-layer clip count; None when the robot cannot report it."""
+        from robot_infra.devices.errors import DeviceError
+
+        try:
+            self._safety_clips = int(self.robot.arm.health().safety_clips)
+        except (DeviceError, AttributeError):
+            self._safety_clips = None
 
     def _arm_command(self, action: np.ndarray) -> dict[str, np.ndarray]:
         config = self.config
@@ -247,8 +321,8 @@ class RealRobotEnv(gym.Env):
 
             pose = np.asarray(arm_state["tcp_pose"], dtype=np.float64)
             xyz = pose[:3] + action[:3] * config.xyz_scale_m
-            if config.safety_box is not None:
-                box = np.asarray(config.safety_box, dtype=np.float64)
+            if self._effective_safety_box is not None:
+                box = self._effective_safety_box
                 xyz = np.clip(xyz, box[:3], box[3:])
             rotation = Rotation.from_rotvec(action[3:6] * config.rot_scale_rad) * Rotation.from_quat(
                 pose[3:7]
@@ -304,6 +378,36 @@ class RealRobotEnv(gym.Env):
         """Nested ``{"state", "frames"}`` dict from the latest reset/step, or None before reset."""
         return self._last_obs
 
+    @property
+    def action_mode(self) -> str:
+        return self.config.action_mode
+
+    @property
+    def gripper_in_action(self) -> bool:
+        return self.config.gripper_in_action
+
+    @property
+    def arm_action_dim(self) -> int:
+        """Action dims excluding the gripper: 6 for cartesian_delta, ``num_joints`` for joint modes."""
+        if self.config.action_mode == "cartesian_delta":
+            return _CARTESIAN_ACTION_DIM
+        return self.config.num_joints
+
+    @property
+    def action_contract(self) -> dict:
+        config = self.config
+        return {
+            "action_mode": config.action_mode,
+            "gripper_in_action": config.gripper_in_action,
+            "arm_action_dim": self.arm_action_dim,
+            "num_joints": config.num_joints,
+            "joint_limits": config.joint_limits,
+            "xyz_scale_m": config.xyz_scale_m,
+            "rot_scale_rad": config.rot_scale_rad,
+            "joint_scale_rad": config.joint_scale_rad,
+            "state_fields": config.state_fields,
+        }
+
     def render(self):
         if self._last_obs is None or not self._last_obs["frames"]:
             return None
@@ -353,6 +457,22 @@ class RealRobotVectorEnv(gym.Env):
     @property
     def task_description(self) -> str:
         return self.env.task_description
+
+    @property
+    def action_mode(self) -> str:
+        return self.env.action_mode
+
+    @property
+    def gripper_in_action(self) -> bool:
+        return self.env.gripper_in_action
+
+    @property
+    def arm_action_dim(self) -> int:
+        return self.env.arm_action_dim
+
+    @property
+    def action_contract(self) -> dict:
+        return self.env.action_contract
 
     def _to_torch(self, obs: dict) -> dict[str, torch.Tensor]:
         out = {

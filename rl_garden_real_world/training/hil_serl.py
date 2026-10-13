@@ -15,18 +15,45 @@ import torch
 _LOGGER = logging.getLogger(__name__)
 
 
-def _state_starts_with_tcp_pose(args) -> bool:
+_FRANKA_REAL_QUAT_SLICE = (3, 7)
+_CARTESIAN_ARM_DIM = 6
+
+
+def _tcp_pose_quat_slice(args) -> tuple[int, int] | None:
     """FrankaRealEnv's state always starts with tcp_pose; real_robot's follows state_fields."""
     if args.env_backend != "real_robot":
-        return True
-    fields = args.real_robot.state_fields
-    return bool(fields) and fields[0] == "tcp_pose"
+        return _FRANKA_REAL_QUAT_SLICE
+    from rl_garden_real_world.envs.wrappers._obs_chain import tcp_pose_quat_slice
+
+    return tcp_pose_quat_slice(args.real_robot)
 
 
 def _hil_serl_env_request(args, run_name):
     from rl_garden.common.env_args import make_env_request
 
-    return make_env_request(args, run_name)
+    env_request = make_env_request(args, run_name)
+    if args.env_backend == "real_robot":
+        # The backend cannot stack frames; apply_obs_chain stacks them (as deploy does).
+        env_request.observation = dataclasses.replace(env_request.observation, frame_stack=1)
+    return env_request
+
+
+def _robot_teleop_kwargs(args) -> dict:
+    """``TeleopPartSource`` arguments for ``--teleop-device robot``.
+
+    A ``RemoteRobot`` only learns its teleop part when it connects, so the device is declared
+    here (mode + gripper; the arm width follows the env) and checked against the real part on
+    connect. A local robot's teleop part is checked at construction either way.
+    """
+    if args.env_backend != "real_robot":
+        raise ValueError("--teleop-device robot needs --env-backend real_robot")
+    real_robot = args.real_robot
+    kwargs = {"joint_limits": real_robot.joint_limits, "joint_scale_rad": real_robot.joint_scale_rad}
+    mode = args.robot_teleop_action_mode
+    if mode is not None:
+        arm_dim = _CARTESIAN_ARM_DIM if mode == "cartesian_delta" else real_robot.num_joints
+        kwargs["teleop_contract"] = (mode, arm_dim, args.robot_teleop_has_gripper)
+    return kwargs
 
 
 def _build_env(args, env_request):
@@ -37,45 +64,23 @@ def _build_env(args, env_request):
     ``FWBWActorLoop``/``FWBWResetFreeWrapper``'s documented requirement that
     it sit outermost)."""
     from rl_garden.envs.backend_registry import make_training_envs
-    from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
     from rl_garden.envs.wrappers.fwbw_reset_free import FWBWResetFreeWrapper
     from rl_garden.envs.wrappers.reward_classifier import RewardClassifierWrapper
-    from rl_garden_real_world.envs.wrappers.rotvec_obs import RotvecObsWrapper
+    from rl_garden_real_world.envs.wrappers._obs_chain import apply_obs_chain
     from rl_garden_real_world.envs.wrappers.grasp_penalty import GraspPenaltyWrapper
     from rl_garden_real_world.envs.wrappers.teleop_intervention import TeleopInterventionWrapper
 
-    if args.env_backend == "real_robot":
-        cfg = args.real_robot
-        if cfg.action_mode != "cartesian_delta" or not cfg.gripper_in_action:
-            raise ValueError(
-                "hil_serl teleop intervention requires real_robot.action_mode=cartesian_delta "
-                "with gripper_in_action=true (7-D action); got "
-                f"action_mode={cfg.action_mode!r}, gripper_in_action={cfg.gripper_in_action}"
-            )
-
     env, _ = make_training_envs(args.env_backend, env_request)
 
-    if args.obs.frame_stack > 1:
-        # FrankaRealEnv has no _init_raw_obs/update_obs_space (ManiSkill-only
-        # APIs) and its camera keys are user-configured, not necessarily
-        # "rgb*"/"depth*"-prefixed -- so image_keys must be passed explicitly.
-        # Reuses classifier_image_keys (same "which keys are cameras"
-        # question the classifier wrapper below already answers) with the
-        # same "every non-state key" fallback used there.
-        stack_image_keys = args.classifier_image_keys or tuple(
-            k for k in env.single_observation_space.spaces if k != "state"
-        )
-        env = ImageFrameStackWrapper(env, frame_stack=args.obs.frame_stack, image_keys=stack_image_keys)
-
-    if args.convert_obs_rotation:
-        if _state_starts_with_tcp_pose(args):
-            env = RotvecObsWrapper(env)
-        else:
-            _LOGGER.warning(
-                "convert_obs_rotation skipped: real_robot state_fields %s do not start with "
-                "tcp_pose, so there is no quaternion at state[3:7]",
-                list(args.real_robot.state_fields),
-            )
+    env = apply_obs_chain(
+        env,
+        frame_stack=args.obs.frame_stack,
+        # Reuses classifier_image_keys: the same "which keys are cameras" question the
+        # classifier wrapper below answers.
+        image_keys=args.classifier_image_keys,
+        convert_obs_rotation=args.convert_obs_rotation,
+        quat_slice=_tcp_pose_quat_slice(args),
+    )
 
     if args.classifier_checkpoint is not None:
         from rl_garden.common.utils import get_device
@@ -96,7 +101,10 @@ def _build_env(args, env_request):
         )
         env = RewardClassifierWrapper(env, classifier_fn, threshold=args.classifier_threshold)
 
-    env = TeleopInterventionWrapper(env, device=args.teleop_device)
+    # Validates the teleop source's action_mode/width against the env's action contract
+    # (also rejects gripper_in_action=false, which GraspPenaltyWrapper below relies on).
+    teleop_kwargs = _robot_teleop_kwargs(args) if args.teleop_device == "robot" else {}
+    env = TeleopInterventionWrapper(env, device=args.teleop_device, **teleop_kwargs)
 
     if args.use_grasp_penalty:
         # Must wrap outside TeleopInterventionWrapper so
@@ -187,6 +195,7 @@ def _run_learner(args) -> None:
 
     from rl_garden.common import Logger, seed_everything
     from rl_garden.common.resolved_config import persist_resolved_config
+    from rl_garden_real_world.action_contract import demo_contract_of
     from rl_garden_real_world.hil_serl import HilSerlLearnerLoop
     from rl_garden.training.online.rlpd_hybrid import build_rlpd_hybrid
 
@@ -235,6 +244,7 @@ def _run_learner(args) -> None:
         demo_dataset_paths=args.demo_dataset_paths,
         train_freq=args.train_freq,
         publish_freq=args.publish_freq,
+        action_contract=demo_contract_of(env),
     )
     try:
         loop.run()
@@ -352,7 +362,12 @@ class HilSerlArgs(RealWorldFrankaArgs, RLPDHybridArgs):
     # not a correctness change, for long image-heavy real-world sessions.
     memory_efficient_buffer: bool = False
 
-    teleop_device: Literal["pico", "spacemouse"] = "pico"
+    # "robot": the teleop part of the real_robot env's robot (robot yaml ``teleop:`` section).
+    teleop_device: Literal["pico", "spacemouse", "robot"] = "pico"
+    # Declares the robot's teleop part for --teleop-device robot over a remote robot, whose
+    # part is only known after connecting (checked then; a mismatch raises DeviceFault).
+    robot_teleop_action_mode: Optional[Literal["cartesian_delta", "joint_abs", "joint_delta"]] = None
+    robot_teleop_has_gripper: bool = True
     # Converts FrankaRealEnv's raw quaternion state slice to a rotation
     # vector (matching the action side's own rotvec convention). Off by
     # default -- changes "state"'s observation shape (20 -> 19), so it's an

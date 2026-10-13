@@ -20,12 +20,13 @@ ZERO_HOME = [0.0] * 7
 FRAME_HW = (24, 32)
 
 
-def _fake_franka() -> FrankaRobot:
+def _fake_franka(**robot_overrides) -> FrankaRobot:
     return FrankaRobot(
         FrankaConfig(
             arm_backend="fake",
             gripper=GripperConfig(backend="fake"),
             cameras=[CameraConfig(name="wrist", backend="fake", width=32, height=24, fps=60)],
+            **robot_overrides,
         )
     )
 
@@ -38,14 +39,14 @@ def _claim_dir(tmp_path, monkeypatch):
 class _Rig:
     """A robot to inject plus the fake arm/gripper that actually execute its commands."""
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, **robot_overrides) -> None:
         self.mode = mode
         self.service = None
         if mode == "local":
-            self.robot = _fake_franka()
+            self.robot = _fake_franka(**robot_overrides)
             self.device_robot = self.robot
         else:
-            self.service = RobotService(_fake_franka(), watchdog_s=30.0)
+            self.service = RobotService(_fake_franka(**robot_overrides), watchdog_s=30.0)
             self.robot = RemoteRobot.from_client(LocalClient(self.service))
             self.device_robot = self.service.robot
         self.envs: list[RealRobotEnv] = []
@@ -213,7 +214,7 @@ def test_reset_rejects_unknown_camera_with_hint(rig):
 
 
 def test_reset_without_any_home_joints_raises_hint():
-    service = RobotService(_fake_franka(), watchdog_s=30.0)
+    service = RobotService(_fake_franka(home_joints=None), watchdog_s=30.0)
     robot = RemoteRobot.from_client(LocalClient(service))
     env = RealRobotEnv(
         RealRobotEnvConfig(remote="local", reset_settle_s=0.0), robot=robot
@@ -307,7 +308,16 @@ def test_joint_delta_without_limits_is_unclipped(rig, monkeypatch):
     np.testing.assert_allclose(np.asarray(sent[-1]["arm"]["joint_pos"]), [env.config.joint_scale_rad] * 7)
 
 
-def test_joint_abs_maps_unit_range_onto_limits(rig, monkeypatch):
+@pytest.fixture(params=["local", "remote"])
+def step_limited_rig(request):
+    """A robot whose yaml sets max_delta_per_step.joint_rad, as joint_abs requires."""
+    rig = _Rig(request.param, max_delta_per_step={"joint_rad": 10.0})
+    yield rig
+    rig.close()
+
+
+def test_joint_abs_maps_unit_range_onto_limits(step_limited_rig, monkeypatch):
+    rig = step_limited_rig
     limits = [[-1.0, 1.0], [0.0, 2.0], [-2.0, -1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
     env = rig.env(action_mode="joint_abs", joint_limits=limits)
     env.reset()
@@ -403,3 +413,142 @@ def test_last_observation_is_none_before_reset_and_dict_after(rig):
     env.reset()
     assert set(env.last_observation) == {"state", "frames"}
     env.close()
+
+
+# -- device-layer safety inheritance --------------------------------------------------
+
+DEVICE_BOX = [-0.01, -0.01, -0.01, 0.01, 0.01, 0.01]
+DEVICE_JOINT_LIMITS = [[-2.5, 2.5]] * 7
+DEVICE_HOME = [0.1] * 7
+CARTESIAN_PUSH = np.array([1, 0, 0, 0, 0, 0, 1], dtype=np.float32)  # +xyz_scale_m = 0.02 in x
+
+
+@pytest.fixture(params=["local", "remote"])
+def limited_rig(request):
+    rig = _Rig(
+        request.param,
+        safety_box=DEVICE_BOX,
+        joint_limits=DEVICE_JOINT_LIMITS,
+        home_joints=DEVICE_HOME,
+        max_delta_per_step={"joint_rad": 0.5},
+    )
+    yield rig
+    rig.close()
+
+
+def _first_target_x(rig, monkeypatch, **env_overrides) -> float:
+    env = rig.env(**env_overrides)
+    env.reset()
+    sent = rig.spy_commands(monkeypatch)
+    env.step(CARTESIAN_PUSH)
+    return float(np.asarray(sent[-1]["arm"]["tcp_pose"])[0])
+
+
+def test_unset_safety_box_is_inherited_from_device(limited_rig, monkeypatch):
+    assert _first_target_x(limited_rig, monkeypatch) == pytest.approx(0.01)
+
+
+def test_tighter_env_safety_box_wins(limited_rig, monkeypatch):
+    tighter = [-0.005, -0.005, -0.005, 0.005, 0.005, 0.005]
+    assert _first_target_x(limited_rig, monkeypatch, safety_box=tighter) == pytest.approx(0.005)
+
+
+def test_looser_env_safety_box_faults_on_first_reset(limited_rig):
+    env = limited_rig.env(safety_box=[-0.02, -0.01, -0.01, 0.02, 0.01, 0.01])
+    with pytest.raises(DeviceFault) as excinfo:
+        env.reset()
+    assert "0.02" in str(excinfo.value) and "0.01" in str(excinfo.value)
+    assert "tighten" in excinfo.value.hint
+    assert not limited_rig.robot.is_connected
+
+
+def test_unset_joint_limits_are_inherited_and_tighter_ones_win(limited_rig, monkeypatch):
+    action = np.array([1, 0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+
+    def first_joint_target(**env_overrides) -> float:
+        env = limited_rig.env(action_mode="joint_delta", joint_scale_rad=5.0, **env_overrides)
+        env.reset()
+        sent = limited_rig.spy_commands(monkeypatch)
+        env.step(action)
+        return float(np.asarray(sent[-1]["arm"]["joint_pos"])[0])
+
+    assert first_joint_target() == pytest.approx(2.5)
+    assert first_joint_target(joint_limits=[[-1.0, 1.0]] * 7) == pytest.approx(1.0)
+
+
+def test_looser_env_joint_limits_fault_on_first_reset(limited_rig):
+    env = limited_rig.env(joint_limits=[[-3.0, 3.0]] * 7)
+    with pytest.raises(DeviceFault, match="joint_limits"):
+        env.reset()
+
+
+def test_device_without_safety_leaves_env_config_unchecked(rig, monkeypatch):
+    from robot_infra.server.remote import RemoteArm
+
+    arm_class = RemoteArm if rig.mode == "remote" else type(rig.arm)
+    monkeypatch.setattr(arm_class, "safety_limits", property(lambda self: None))
+    assert _first_target_x(rig, monkeypatch, safety_box=[-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]) == (
+        pytest.approx(0.02)
+    )
+
+
+def test_unset_home_joints_are_inherited_from_device(limited_rig):
+    env = limited_rig.env(home_joints=None)
+    obs, _ = env.reset()
+    np.testing.assert_allclose(obs["state"]["joint_pos"], DEVICE_HOME, atol=1e-6)
+
+
+def test_joint_abs_without_device_joint_step_limit_faults_with_hint(rig):
+    env = rig.env(action_mode="joint_abs", joint_limits=[[-1.0, 1.0]] * 7)
+    with pytest.raises(DeviceFault, match="max_delta_per_step.joint_rad") as excinfo:
+        env.reset()
+    assert "robot yaml" in excinfo.value.hint
+    assert not rig.robot.is_connected
+
+
+def test_joint_abs_with_device_unaware_of_safety_limits_faults(limited_rig, monkeypatch):
+    from robot_infra.server.remote import RemoteArm
+
+    arm_class = RemoteArm if limited_rig.mode == "remote" else type(limited_rig.arm)
+    monkeypatch.setattr(arm_class, "safety_limits", property(lambda self: None))  # older daemon
+    env = limited_rig.env(action_mode="joint_abs", joint_limits=[[-1.0, 1.0]] * 7)
+    with pytest.raises(DeviceFault, match="max_delta_per_step.joint_rad"):
+        env.reset()
+
+
+def test_joint_abs_with_device_joint_step_limit_passes(limited_rig):
+    env = limited_rig.env(action_mode="joint_abs", joint_limits=[[-1.0, 1.0]] * 7)
+    env.reset()
+
+
+def test_joint_delta_does_not_need_device_joint_step_limit(rig):
+    rig.env(action_mode="joint_delta").reset()
+
+
+def test_step_info_carries_safety_clips(limited_rig):
+    env = limited_rig.env()
+    env.reset()
+    _, _, _, _, info = env.step(CARTESIAN_PUSH)
+    assert info["safety_clips"] == 0
+
+
+# -- robot with a teleop part ---------------------------------------------------------
+
+
+@pytest.fixture(params=["local", "remote"])
+def teleop_rig(request):
+    from robot_infra.devices.teleop import TeleopConfig
+
+    rig = _Rig(request.param, teleop=TeleopConfig(name="leader", backend="fake"))
+    yield rig
+    rig.close()
+
+
+def test_teleop_part_does_not_leak_into_env_observation(teleop_rig):
+    env = teleop_rig.env()
+    obs, _ = env.reset()
+    assert "teleop" in teleop_rig.robot.get_observation()
+    obs, *_ = env.step(np.zeros(env.action_space.shape, dtype=np.float32))
+    assert set(obs) == {"state", "frames"}
+    assert list(obs["state"]) == list(env.config.state_fields)
+    assert set(obs["frames"]) == {"wrist"}

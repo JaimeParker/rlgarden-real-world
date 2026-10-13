@@ -26,12 +26,15 @@ class _FakeEnv(gym.Env):
 
 
 class _FakeTeleop:
-    def __init__(self, samples):
+    def __init__(self, samples, call_order=None):
         self._samples = list(samples)
         self.reset_calls = 0
+        self._call_order = call_order
 
     def reset(self):
         self.reset_calls += 1
+        if self._call_order is not None:
+            self._call_order.append("teleop")
 
     def poll(self):
         return self._samples.pop(0)
@@ -81,3 +84,39 @@ def test_reset_resets_teleop_device_too():
     wrapped.reset()
     assert teleop.reset_calls == 1
     assert env.reset_calls == 1
+
+
+def test_reset_resets_env_before_teleop_so_presses_during_homing_are_dropped():
+    order = []
+    env = _FakeEnv()
+    original_reset = env.reset
+    env.reset = lambda **kwargs: (order.append("env"), original_reset(**kwargs))[1]
+    wrapped = TeleopInterventionWrapper(env, teleop=_FakeTeleop([], call_order=order))
+    wrapped.reset()
+    assert order == ["env", "teleop"]
+
+
+def test_episode_end_truncates_the_episode_with_or_without_intervention():
+    for intervened in (False, True):
+        teleop = _FakeTeleop([_sample(intervened=intervened, episode_end=True), _sample(intervened=intervened)])
+        wrapped = TeleopInterventionWrapper(_FakeEnv(), teleop=teleop)
+        _, _, terminated, truncated, info = wrapped.step(torch.zeros(1, 7))
+        assert info["human_episode_end"] is True
+        assert truncated.dtype == torch.bool and bool(truncated) is True and not bool(terminated)
+        _, _, _, truncated, info = wrapped.step(torch.zeros(1, 7))
+        assert info["human_episode_end"] is False and bool(truncated) is False
+
+
+def test_last_sent_gripper_action_tracks_policy_and_human_and_resets_to_open():
+    wrapped = TeleopInterventionWrapper(
+        _FakeEnv(), teleop=_FakeTeleop([_sample(intervened=False), _sample(intervened=True, action_value=-0.5)])
+    )
+    assert wrapped._last_gripper_action == 1.0
+    policy_action = torch.zeros(1, 7)
+    policy_action[0, -1] = -3.0  # clipped by the env to -1
+    wrapped.step(policy_action)
+    assert wrapped._last_gripper_action == -1.0
+    wrapped.step(policy_action)
+    assert wrapped._last_gripper_action == -0.5
+    wrapped.reset()
+    assert wrapped._last_gripper_action == 1.0
