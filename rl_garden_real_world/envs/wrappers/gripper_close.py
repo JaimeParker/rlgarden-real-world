@@ -1,8 +1,8 @@
 """Gripper-always-closed action wrapper (HIL-SERL's ``GripperCloseEnv``,
 ``3rd_party/hil-serl/serl_robot_infra/franka_env/envs/wrappers.py``):
-truncates a 7D action space (6D pose delta + 1D gripper) to 6D for tasks
-that never open/close the gripper, zero-padding the gripper dimension back
-before forwarding to the wrapped env.
+removes the gripper dimension (default: 7D -> 6D) for tasks that never
+open/close the gripper, re-inserting ``closed_value`` there before
+forwarding to the wrapped env.
 
 Lives in ``real_world/`` rather than ``rl_garden/envs/wrappers/``: the 7D,
 last-dim-is-gripper action shape it asserts is ``FrankaRealEnv``'s own
@@ -24,14 +24,29 @@ from gymnasium.vector.utils import batch_space
 
 
 class GripperCloseEnv(gym.ActionWrapper):
-    def __init__(self, env: gym.Env) -> None:
+    """Hides the gripper dimension (``gripper_dim``, default last) from the
+    policy and always forwards ``closed_value`` for it. The base env's gripper
+    threshold decides open/close, so 0.0 means "closed" under the Franka
+    [-1, 1] convention; a continuous gripper passes its own closed action value.
+    """
+
+    def __init__(
+        self, env: gym.Env, gripper_dim: int = -1, closed_value: float = 0.0
+    ) -> None:
         super().__init__(env)
         single = env.single_action_space
-        assert single.shape == (7,), (
-            f"GripperCloseEnv requires a 7D action space, got {single.shape}."
-        )
+        if len(single.shape) != 1 or single.shape[0] < 2:
+            raise ValueError(
+                f"GripperCloseEnv requires a 1-D action space with >= 2 dims, got {single.shape}."
+            )
+        full_dim = single.shape[0]
+        if not -full_dim <= gripper_dim < full_dim:
+            raise ValueError(f"gripper_dim={gripper_dim} out of range for {full_dim}-D action space.")
+        self._gripper_dim = gripper_dim % full_dim
+        self._closed_value = closed_value
+        self._kept_dims = [i for i in range(full_dim) if i != self._gripper_dim]
         self.single_action_space = spaces.Box(
-            low=single.low[:6], high=single.high[:6], dtype=single.dtype
+            low=single.low[self._kept_dims], high=single.high[self._kept_dims], dtype=single.dtype
         )
         self.action_space = batch_space(self.single_action_space, env.num_envs)
 
@@ -41,8 +56,9 @@ class GripperCloseEnv(gym.ActionWrapper):
         return getattr(self.env, name)
 
     def action(self, action: torch.Tensor) -> torch.Tensor:
-        pad = torch.zeros(*action.shape[:-1], 1, device=action.device, dtype=action.dtype)
-        return torch.cat([action, pad], dim=-1)
+        full = action.new_full((*action.shape[:-1], len(self._kept_dims) + 1), self._closed_value)
+        full[..., self._kept_dims] = action
+        return full
 
     def step(self, action: torch.Tensor):
         # Overrides step() directly (not just action()) since
@@ -52,5 +68,5 @@ class GripperCloseEnv(gym.ActionWrapper):
         obs, reward, terminated, truncated, info = self.env.step(self.action(action))
         if "intervene_action" in info:
             info = dict(info)
-            info["intervene_action"] = info["intervene_action"][..., :6]
+            info["intervene_action"] = info["intervene_action"][..., self._kept_dims]
         return obs, reward, terminated, truncated, info

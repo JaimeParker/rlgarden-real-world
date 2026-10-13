@@ -14,6 +14,8 @@ dependencies = [
     "gymnasium>=0.29",
     "tyro",
     "requests",
+    # Device layer for the generic real_robot env backend (envs/real_robot).
+    "rlgarden-robot-infra @ git+https://github.com/JaimeParker/rlgarden-robot-infra.git",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +33,7 @@ dev = ["pytest", "scipy"]
 
 [project.entry-points."rlgarden.env_backends"]
 franka_real = "rl_garden_real_world.envs.backends.franka_real"
+real_robot = "rl_garden_real_world.envs.backends.real_robot"
 
 [tool.setuptools.packages.find]
 include = ["rl_garden_real_world*"]

@@ -8,11 +8,22 @@ from __future__ import annotations
 
 import glob
 import pickle
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
 _TRANSITION_TENSOR_KEYS = ("obs", "next_obs", "action", "reward", "done")
+
+
+def as_dict_observation(obs: Any) -> Any:
+    """Wrap a legacy flat-tensor observation as ``{"state": obs}``.
+
+    rl-garden replay buffers are Dict-only (state-only observations live
+    under the ``"state"`` key), but pkls written before that change (and
+    state-only demo pkls) store ``obs``/``next_obs`` as bare tensors.
+    Dict observations (what ``FrankaRealEnv`` emits) pass through untouched.
+    """
+    return obs if isinstance(obs, Mapping) else {"state": obs}
 
 
 def load_demo_pkls(
@@ -41,8 +52,8 @@ def load_demo_pkls(
                     if k not in _TRANSITION_TENSOR_KEYS
                 }
                 adder(
-                    tensors["obs"],
-                    tensors["next_obs"],
+                    as_dict_observation(tensors["obs"]),
+                    as_dict_observation(tensors["next_obs"]),
                     tensors["action"],
                     tensors["reward"],
                     tensors["done"],

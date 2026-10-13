@@ -1,7 +1,10 @@
 """Tests for the franka_real env backend's EnvRequest -> config translation."""
 from __future__ import annotations
 
+import pytest
+
 from rl_garden.envs.backend_registry import EnvRequest
+from rl_garden.observations import ObservationConfig
 from rl_garden_real_world.envs.backends.franka_real import FrankaRealBackend
 from rl_garden_real_world.training._args import FrankaRealConfig
 
@@ -10,12 +13,12 @@ def _req(**overrides) -> EnvRequest:
     defaults = dict(
         env_id="unused",
         num_envs=8,
-        obs_mode="rgb",
+        # State-only: the backend never passes a camera_capture to
+        # make_franka_real_env, so it only ever emits {"state"}.
+        observation=ObservationConfig(),
         control_mode="",
         render_mode="rgb_array",
         seed=1,
-        camera_width=128,
-        camera_height=128,
         num_eval_envs=4,
         reward_scale=2.0,
         reward_bias=0.5,
@@ -66,3 +69,8 @@ def test_make_train_env_and_make_eval_env_both_build_the_same_style_env(monkeypa
     assert FrankaRealBackend.make_train_env(req) == "sentinel-env"
     assert FrankaRealBackend.make_eval_env(req) == "sentinel-env"
     assert len(captured) == 2
+
+
+def test_make_cfg_rejects_visual_observation_request():
+    with pytest.raises(NotImplementedError, match="state observations"):
+        FrankaRealBackend._make_cfg(_req(observation=ObservationConfig(rgb=("wrist",))))

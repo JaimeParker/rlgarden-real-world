@@ -52,8 +52,8 @@ def run_real_world_bc(args: "RealWorldBCArgs") -> None:
     # calls reset()/step() on it, and FrankaRealEnv makes no network call
     # until one of those is (mirrors serl.py's/hil_serl.py's learner-side
     # env construction). Reuses the offline-args-shaped request builder
-    # (BCArgs has no online-training fields like num_envs/frame_stack that
-    # the online _rlpd_env_request expects).
+    # (BCArgs has no online-training num_envs; _eval_env_request resolves
+    # the offline spec_num_envs/num_eval_steps itself).
     env_request = _eval_env_request(args)
     env, _ = make_training_envs(args.env_backend, env_request)
 

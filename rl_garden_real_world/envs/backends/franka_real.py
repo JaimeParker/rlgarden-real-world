@@ -25,6 +25,14 @@ class FrankaRealBackend(EnvBackend):
     def _make_cfg(cls, req: EnvRequest):
         from rl_garden_real_world.envs.franka_real.config import FrankaRealEnvConfig
 
+        if req.observation.is_visual or req.observation.extra_state:
+            # make_franka_real_env is never given a camera_capture here, so
+            # this backend can only emit {"state"}; fail at request time
+            # instead of as a key-set ObservationContractError later.
+            raise NotImplementedError(
+                "franka_real backend only supports state observations "
+                f"(--obs.rgb/--obs.depth/--obs.extra-state unset); got {req.observation!r}"
+            )
         fr = req.backend_config  # FrankaRealConfig or None
         env_kwargs = (
             json.loads(fr.env_kwargs_json)

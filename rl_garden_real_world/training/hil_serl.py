@@ -13,9 +13,9 @@ import torch
 
 
 def _hil_serl_env_request(args, run_name):
-    from rl_garden.training.online.rlpd import _rlpd_env_request
+    from rl_garden.common.env_args import make_env_request
 
-    return _rlpd_env_request(args, run_name)
+    return make_env_request(args, run_name)
 
 
 def _build_env(args, env_request):
@@ -35,7 +35,7 @@ def _build_env(args, env_request):
 
     env, _ = make_training_envs(args.env_backend, env_request)
 
-    if args.frame_stack > 1:
+    if args.obs.frame_stack > 1:
         # FrankaRealEnv has no _init_raw_obs/update_obs_space (ManiSkill-only
         # APIs) and its camera keys are user-configured, not necessarily
         # "rgb*"/"depth*"-prefixed -- so image_keys must be passed explicitly.
@@ -45,7 +45,7 @@ def _build_env(args, env_request):
         stack_image_keys = args.classifier_image_keys or tuple(
             k for k in env.single_observation_space.spaces if k != "state"
         )
-        env = ImageFrameStackWrapper(env, frame_stack=args.frame_stack, image_keys=stack_image_keys)
+        env = ImageFrameStackWrapper(env, frame_stack=args.obs.frame_stack, image_keys=stack_image_keys)
 
     if args.convert_obs_rotation:
         env = RotvecObsWrapper(env)
@@ -285,7 +285,7 @@ def run_hil_serl(args: "HilSerlArgs") -> None:
 from dataclasses import dataclass, field  # noqa: E402
 from typing import Literal, Optional, Sequence  # noqa: E402
 
-from rl_garden.encoders.resnet import PoolingMethod  # noqa: E402
+from rl_garden.encoders.config import EncoderConfig  # noqa: E402
 from rl_garden.training.online.rlpd_hybrid import RLPDHybridArgs  # noqa: E402
 from rl_garden_real_world.training._args import (  # noqa: E402
     FrankaRealConfig,
@@ -321,7 +321,7 @@ class HilSerlArgs(RealWorldFrankaArgs, RLPDHybridArgs):
     record_video_dir: Optional[str] = None
 
     # Replay-buffer image-frame dedup (MemoryEfficientDictReplayBuffer) --
-    # only meaningful when frame_stack > 1; a memory-usage optimization,
+    # only meaningful when obs.frame_stack > 1; a memory-usage optimization,
     # not a correctness change, for long image-heavy real-world sessions.
     memory_efficient_buffer: bool = False
 
@@ -355,15 +355,20 @@ class HilSerlArgs(RealWorldFrankaArgs, RLPDHybridArgs):
     sync_port_backward: Optional[int] = None
     fwbw_direction: Literal["forward", "backward"] = "forward"
 
-    # Below: HilSerlArgs-local overrides of RLPDHybridArgs/VisionArgs
+    # Below: HilSerlArgs-local overrides of RLPDHybridArgs/EncoderConfig
     # defaults, matching what HIL-SERL's own real-robot recipes
     # (serl_launcher/serl_launcher/utils/launcher.py) actually run --
-    # scoped here only, not touched on RLPDHybridArgs/VisionArgs themselves,
-    # so sim rlpd_hybrid training and serl.py/SerlArgs are unaffected. See
-    # docs/hil-serl-roadmap.md's "Behavioral Divergences" section.
+    # scoped here only, not touched on RLPDHybridArgs/EncoderConfig
+    # themselves, so sim rlpd_hybrid training and serl.py/SerlArgs are
+    # unaffected. See docs/hil-serl-roadmap.md's "Behavioral Divergences"
+    # section.
     backup_entropy: bool = False
-    image_augmentation: Literal["none", "random_shift"] = "random_shift"
-    pooling_method: PoolingMethod = "spatial_learned_embeddings"
+    encoder: EncoderConfig = field(
+        default_factory=lambda: EncoderConfig(
+            image_augmentation="random_shift",
+            pooling_method="spatial_learned_embeddings",
+        )
+    )
 
 
 registry.register("hil_serl", HilSerlArgs, run_hil_serl)

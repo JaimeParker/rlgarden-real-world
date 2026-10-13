@@ -5,9 +5,9 @@ import dataclasses
 
 
 def _serl_env_request(args, run_name):
-    from rl_garden.training.online.rlpd import _rlpd_env_request
+    from rl_garden.common.env_args import make_env_request
 
-    return _rlpd_env_request(args, run_name)
+    return make_env_request(args, run_name)
 
 
 def _run_actor(args) -> None:

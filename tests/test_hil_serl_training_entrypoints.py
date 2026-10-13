@@ -9,6 +9,7 @@ import torch
 from gymnasium import spaces
 from gymnasium.vector.utils import batch_space
 
+from rl_garden.observations import ObservationConfig
 from rl_garden_real_world.training.hil_serl import HilSerlArgs, _build_env
 
 
@@ -18,16 +19,16 @@ def test_hil_serl_args_override_real_robot_recipe_defaults_locally():
     docs/hil-serl-roadmap.md's "Behavioral Divergences" section."""
     hil_serl_args = HilSerlArgs()
     assert hil_serl_args.backup_entropy is False
-    assert hil_serl_args.image_augmentation == "random_shift"
-    assert hil_serl_args.pooling_method == "spatial_learned_embeddings"
+    assert hil_serl_args.encoder.image_augmentation == "random_shift"
+    assert hil_serl_args.encoder.pooling_method == "spatial_learned_embeddings"
     assert hil_serl_args.convert_obs_rotation is False
 
     from rl_garden.training.online.rlpd_hybrid import RLPDHybridArgs
 
     sim_args = RLPDHybridArgs()
     assert sim_args.backup_entropy is True
-    assert sim_args.image_augmentation == "none"
-    assert sim_args.pooling_method == "spatial_softmax"
+    assert sim_args.encoder.image_augmentation == "none"
+    assert sim_args.encoder.pooling_method == "spatial_softmax"
 
 
 class _FakeEnv(gym.Env):
@@ -59,7 +60,6 @@ class _NoInterventionSample:
 def _base_args(**overrides) -> HilSerlArgs:
     kwargs = dict(
         teleop_device="pico",
-        obs_mode="state",
         hidden_dim=8,
         discrete_hidden_dim=8,
     )
@@ -126,7 +126,7 @@ def test_build_env_skips_frame_stack_wrapper_by_default(monkeypatch):
         "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
     )
     args = _base_args()
-    assert args.frame_stack == 1
+    assert args.obs.frame_stack == 1
     env = _build_env(args, env_request=None)
 
     from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper
@@ -149,7 +149,7 @@ def test_build_env_composes_image_frame_stack_wrapper_when_frame_stack_set(monke
     monkeypatch.setattr(
         "rl_garden_real_world.envs.wrappers.teleop_intervention.EETwistTeleOpWrapper", _FakeTeleop
     )
-    args = _base_args(frame_stack=3, classifier_checkpoint=None)
+    args = _base_args(obs=ObservationConfig(frame_stack=3), classifier_checkpoint=None)
     env = _build_env(args, env_request=None)
 
     from rl_garden.envs.wrappers.frame_stack import ImageFrameStackWrapper

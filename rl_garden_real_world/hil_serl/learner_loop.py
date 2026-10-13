@@ -41,7 +41,7 @@ import torch
 
 from rl_garden.algorithms.off_policy import OffPolicyAlgorithm
 from rl_garden_real_world.learner_loop import _TRANSITION_TENSOR_KEYS, LearnerLoop
-from rl_garden_real_world.training._demo_loading import load_demo_pkls
+from rl_garden_real_world.training._demo_loading import as_dict_observation, load_demo_pkls
 
 
 class HilSerlLearnerLoop(LearnerLoop):
@@ -105,7 +105,14 @@ class HilSerlLearnerLoop(LearnerLoop):
             for k, v in transition.items()
             if k not in _TRANSITION_TENSOR_KEYS
         }
-        adder(tensors["obs"], tensors["next_obs"], tensors["action"], tensors["reward"], tensors["done"], **extra)
+        adder(
+            as_dict_observation(tensors["obs"]),
+            as_dict_observation(tensors["next_obs"]),
+            tensors["action"],
+            tensors["reward"],
+            tensors["done"],
+            **extra,
+        )
 
     def _on_transition(self, transition: dict[str, Any]) -> None:
         intervened = bool(transition.pop("intervened", False))
